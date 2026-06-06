@@ -1,0 +1,18 @@
+# Model GGUF files - too large for git
+models/
+
+# llama.cpp binary directory - too large for git
+llama.cpp-b9360-cuda12/
+
+# Downloaded zip files
+*.zip
+
+# Runtime logs (not useful in repo)
+*.log
+*.pid
+
+# Runtime error logs
+*.err.log
+
+# OMC session state (not project content)
+.omc/

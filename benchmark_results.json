@@ -1,0 +1,39 @@
+{
+  "server_url": "http://127.0.0.1:8080/v1/chat/completions",
+  "model": "Qwen3.6-27B-IQ3_XXS",
+  "tasks_passed": 3,
+  "tasks_total": 3,
+  "average_tokens_per_sec": 22.47,
+  "results": [
+    {
+      "name": "lru_cache",
+      "passed": true,
+      "elapsed_sec": 11.69,
+      "prompt_tokens": 136,
+      "completion_tokens": 177,
+      "tokens_per_sec": 15.14,
+      "code_preview": "from collections import OrderedDict\n\nclass LRUCache:\n    def __init__(self, capacity: int):\n        self.capacity = capacity\n        self.cache = OrderedDict()\n\n    def get(self, key: int) -> int:\n        if key not in self.cache:\n            return -1\n        # Move to end to mark as most recently used\n        self.cache.move_to_end(key)\n        return self.cache[key]\n\n    def put(self, key: int, value: int) -> None:\n        if key in self.cache:\n            # Move to end to mark as most recently used\n            self.cache.move_to_end(key)\n        self.cache[key] = value\n        if len(self.cache) > self.capacity:",
+      "test_output": "TESTS_PASSED"
+    },
+    {
+      "name": "topological_sort",
+      "passed": true,
+      "elapsed_sec": 6.49,
+      "prompt_tokens": 130,
+      "completion_tokens": 173,
+      "tokens_per_sec": 26.66,
+      "code_preview": "def topo_sort(num_nodes: int, edges: list[tuple[int, int]]) -> list[int]:\n    adj = [[] for _ in range(num_nodes)]\n    in_degree = [0] * num_nodes\n    for u, v in edges:\n        adj[u].append(v)\n        in_degree[v] += 1\n\n    queue = [i for i in range(num_nodes) if in_degree[i] == 0]\n    result = []\n\n    while queue:\n        u = queue.pop(0)\n        result.append(u)\n        for v in adj[u]:\n            in_degree[v] -= 1\n            if in_degree[v] == 0:\n                queue.append(v)\n\n    if len(result) != num_nodes:\n        raise ValueError(\"cycle\")",
+      "test_output": "TESTS_PASSED"
+    },
+    {
+      "name": "word_break_paths",
+      "passed": true,
+      "elapsed_sec": 6.25,
+      "prompt_tokens": 127,
+      "completion_tokens": 160,
+      "tokens_per_sec": 25.61,
+      "code_preview": "def all_segmentations(s: str, words: set[str]) -> list[str]:\n    memo = {}\n\n    def helper(i: int) -> list[str]:\n        if i == len(s):\n            return [\"\"]\n        if i in memo:\n            return memo[i]\n\n        results = []\n        for j in range(i + 1, len(s) + 1):\n            word = s[i:j]\n            if word in words:\n                suffixes = helper(j)\n                for suffix in suffixes:\n                    if suffix:\n                        results.append(word + \" \" + suffix)\n                    else:\n                        results.append(word)\n",
+      "test_output": "TESTS_PASSED"
+    }
+  ]
+}
