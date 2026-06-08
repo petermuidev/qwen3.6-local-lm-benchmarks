@@ -2,7 +2,7 @@
 
 Based on r/LocalLLaMA research, the biggest performance gap is the **runtime**. Switching from upstream llama.cpp to ik_llama.cpp with `--n-cpu-moe` is reported to take Q4_K_M from 16/22 score + 26 tok/s to 22/22 score + **61 tok/s** on identical hardware (RTX 5060 Ti 16GB + DDR4).
 
-> **WARNING — Windows Performance Unknown:** All verified high-speed benchmarks (110 tok/s, 72.9 tok/s, 80 tok/s) are on **Linux** (CachyOS, Ubuntu). Two Reddit users report disappointing ik_llama.cpp performance on Windows. The 61/74.7 tok/s bobaburger claims are **unverified** — no source post found, likely DDR5 + Linux. **Benchmark on our Windows setup before relying on these numbers.** See [REDDIT_SYNTHESIS.md](REDDIT_SYNTHESIS.md#windows-warning) for full evidence.
+> **WARNING — ik_llama.cpp CONFIRMED SLOW ON WINDOWS:** Tested on our hardware (i5-14600KF Raptor Lake + RTX 5060 Ti 16GB + Windows 11): ik_llama.cpp AVX2 build gives **2 tok/s** vs upstream llama.cpp **23.67 tok/s** — 10x slower. AVX512 builds crash with "Illegal instruction" (Raptor Lake's partial AVX512 is incompatible). ik_llama.cpp is **NOT viable on this hardware**. Stick with upstream llama.cpp. See benchmark_results/ for evidence.
 
 ---
 
@@ -265,13 +265,11 @@ No major speed fix possible without switching to ik_llama.cpp. The 27B config is
 
 ### Recommended benchmark order
 
-1. **Baseline retest**: Run current configs with benchmark_qwen_mtp.py to establish fresh baselines
-2. **ik_llama.cpp Windows validation**: Download pre-built binary (Thireus or X5R), test 27B IQ3_XXS with same flags — compare against llama.cpp baseline. **This is the critical gate: if ik_llama.cpp is not faster on Windows, stop here and use upstream.**
-3. **ik_llama.cpp 27B + IQ4_KS**: If step 2 passes, download IQ4_KS model (14.1GB), benchmark — should be 1.5-1.75x faster than IQ4_XS
-4. **ik_llama.cpp 27B + MTP**: Download MTP GGUF, run with `--spec-type mtp:n_max=1,p_min=0.0`, benchmark
-5. **ik_llama.cpp 35B MoE**: Run with `--n-cpu-moe 16 -fmoe`, benchmark
-6. **ik_llama.cpp 35B MoE + fit**: Run with `--fit` (no n-cpu-moe), compare against n-cpu-moe
-7. **TurboQuant 35B MoE**: If interested, build atomic fork, benchmark with turbo3 KV + NextN
+1. ~~ik_llama.cpp Windows validation~~ **FAILED** — 2 tok/s vs 23.67 tok/s on upstream llama.cpp
+2. **Upstream llama.cpp optimizations**: Focus on what works — MTP with upstream llama.cpp, quant tuning
+3. **Upstream llama.cpp 27B + MTP**: Test with `--spec-type draft-mtp` and MTP GGUF (Radamanthys11)
+4. **Upstream llama.cpp 35B MoE**: Retest baseline, try newer llama.cpp builds (b9484+)
+5. **TurboQuant 35B MoE** (if interested): Different fork, may not have same Windows penalty
 
 ---
 
@@ -279,13 +277,14 @@ No major speed fix possible without switching to ik_llama.cpp. The 27B config is
 
 | Config | Runtime | Score | Speed | Source | OS |
 |--------|---------|-------|-------|--------|----|
-| Q4_K_M + fit auto | llama.cpp | 16/22 | 26 tok/s | Our current | Windows |
+| IQ3_XXS 27B (our baseline) | llama.cpp b9360 | 4/4 | **23.67 tok/s** | Our benchmark | Windows |
+| IQ3_XXS 27B (ik_llama AVX2) | ik_llama.cpp b4829 | — | **2 tok/s** | Our benchmark | Windows |
 | Q4_K_M + n-cpu-moe 16 | ik_llama.cpp | 22/22 | **61 tok/s** | bobaburger (**UNVERIFIED**) | Unknown (likely Linux) |
 | Q4_K_M + fit (no batch flags) | ik_llama.cpp | — | **74.7 tok/s** | bobaburger (**UNVERIFIED**) | Unknown (likely Linux) |
 | IQ3_S (fits entirely in VRAM) | llama.cpp | — | 98 tok/s | njannasch.dev | Linux |
 | IQ3_S + MTP (fits VRAM) | llama.cpp | — | 144 tok/s | njannasch.dev | Linux |
 
-**Key insight**: All top benchmarks are on Linux + DDR5. Zero verified Windows benchmarks exist. DDR4 + Windows will likely be slower.
+**Key insight**: ik_llama.cpp is 10x slower than llama.cpp on our Windows hardware (AVX2) and crashes with AVX512. All top ik_llama benchmarks are Linux. **Upstream llama.cpp is the right runtime for our setup.**
 
 ---
 
