@@ -1,0 +1,2328 @@
+[
+  {
+    "kind": "t3",
+    "data": {
+      "approved_at_utc": null,
+      "subreddit": "LocalLLaMA",
+      "selftext": "## TL;DR\n\n- best setup I tested on a RTX 3090 24 GB: `ik_llama.cpp` + `Qwen3.6-27B-MTP-IQ4_KS.gguf`\n- `156k` context, `q8_0/q8_0` KV, MTP, vision on CPU\n- benchmark result on a `~5.9k` prompt + `1k` output: about `1261 tok/s` prefill, `72.9 tok/s` decode\n- `llama.cpp` was a good start, BeeLlama worth testing, but `ik_llama.cpp` performed the best\n\n## What was tested\n\n- upstream `llama.cpp`: easy baseline and a good place to start\n- `beellama.cpp`: promising on paper, but I could not reproduce the expected speed on my setup\n- `ik_llama.cpp`: best decode/prefill, best VRAM fit\n\nI also spent time with `vLLM` / `club-3090`, but I am leaving it out of the table because I did not finish a clean apples-to-apples run in this batch. We were seeing about `78 tok/s` on responses, but the high-context OOM cliffs were too flaky, so I dropped it until that is fixed. I have not tested it recently, but the repo still flags the single-card long-context issue as unresolved.\n\n## The benchmark\n\nOne-shot chat-completion task:\n\n- prompt size: about `5.9k` tokens\n- output size: `1024` tokens\n- task shape: a code-review / migration note over local setup files\n\nSo it mostly tests:\n\n- prefill speed on a medium-large real prompt\n- decode speed on a sustained `1k`-token generation\n\nSo that is not best-case tok/s, but closer to reality.\n\n## The setup I kept\n\nThis is the profile I kept as my default:\n\n- backend: [`ikawrakow/ik_llama.cpp`](https://github.com/ikawrakow/ik_llama.cpp)\n- current tested build: `4507 (c35189d8)`\n- model: [`ubergarm/Qwen3.6-27B-GGUF`](https://huggingface.co/ubergarm/Qwen3.6-27B-GGUF)\n- direct model file: [`Qwen3.6-27B-MTP-IQ4_KS.gguf`](https://huggingface.co/ubergarm/Qwen3.6-27B-GGUF/blob/main/Qwen3.6-27B-MTP-IQ4_KS.gguf)\n\nHigh-level launch shape:\n\n- `--ctx-size 156000`\n- `--cache-type-k q8_0`\n- `--cache-type-v q8_0`\n- `--flash-attn on`\n- `--multi-token-prediction`\n- `--draft-max 4`\n- `--draft-p-min 0.0`\n- `--merge-qkv`\n- `--merge-up-gate-experts`\n- `--cache-ram 32768`\n- `--ctx-checkpoints 32`\n- `--reasoning on`\n- `--reasoning-format deepseek`\n- `--chat-template-kwargs '{\"preserve_thinking\":true}'`\n- `--no-mmproj-offload`\n\nNotes:\n\n- built-in MTP in `ik_llama.cpp` worked better for me than the other speculative paths\n- `q8_0` KV was good quality; you can opt into `q4`, but there is plenty of VRAM headroom with `IQ4_KS`\n\n## Why `IQ4_KS`\n\n- much smaller than Unsloth `UD-Q4_K_XL`\n- quality stayed high enough that I did not feel a real penalty\n- on a `24 GB` card, those saved GiB matter once you start pushing context and sane u-batch sizes\n- to be fair, there is probably room for a higher quant, maybe `q5`; I have not tested that yet\n- [`Qwen-3.6 quants` discussion #1663](https://github.com/ikawrakow/ik_llama.cpp/discussions/1663)\n\nTLDR:\n\n- `Qwen 3.6` quantizes very well in `IQ4_KS`\n- `ikawrakow` measured `IQ4_KS` as very close to, or better than, `UD_Q4_XL`\n- Unsloth `UD-Q4_K_XL` needs about `2.8 GiB` more to land in the same neighborhood\n\nIf you want the background on the quant family itself:\n\n- [`New quantization types IQ2_K, IQ3_K, IQ4_K, IQ5_K` discussion #8](https://github.com/ikawrakow/ik_llama.cpp/discussions/8)\n\n## Vision\n\n- projector on CPU by default: `--mmproj ...` + `--no-mmproj-offload`\n- move it to GPU if you want faster image processing and are willing to spend roughly `1.5 GiB` more VRAM\n- if that OOMs, lower context or switch to `q4` KV\n\n## GPU Stuff\n\nThis was on Linux with the desktop on the iGPU and the RTX 3090 used only for LLMs.\n\n- power limit: `330 W`\n- memory OC: `+600`\n- undervolt: flattened at about `1875 MHz @ 868 mV` (`LACT` now has a curve editor)\n\n## Some experiments did not make the default setup better\n\n- `--spec-autotune` on `ik_llama.cpp`: no meaningful gain on this workload\n- `--mtp-requantize-output-tensor q6_K`: sometimes faster, but inconsistent and costs about `1 GiB` extra VRAM, so I did not keep it\n- BeeLlama DFlash precision quickstart: loaded fine, but was much slower here than expected\n- upstream `llama.cpp` MTP paths: good baseline, but slower than `ik_llama.cpp` in my tests\n\nBeeLlama and `vLLM` are still worth exploring. I just did not land on a setup there that beat the `ik_llama.cpp` profile for my workload.\n\n## Results\n\nThese are the useful comparison points from the same real prompt / `1024`-token output benchmark.\n\n| Backend | Model / quant | Spec path | Context | KV cache | Prefill tok/s | Decode tok/s | Wall time | Notes |\n| --- | --- | --- | ---: | --- | ---: | ---: | ---: | --- |\n| `ik_llama.cpp` | `Qwen3.6-27B-MTP-IQ4_KS` | built-in MTP | `156k` | `q8_0/q8_0` | `1260.95` | `72.93` | `18.79s` | best overall default profile |\n| `llama.cpp` upstream | `Qwen3.6-27B-UD-Q4_K_XL` | `draft-mtp` | `32k` | `q4_0/q4_0` | `1247.65` | `51.20` | `24.80s` | easiest starting point |\n| `llama.cpp` upstream tuned | `Qwen3.6-27B-UD-Q4_K_XL` | `draft-mtp` | `32k` | `q8_0/q8_0` | `1242.81` | `56.66` | `22.88s` | old-like flags helped, still slower |\n| `beellama.cpp` | `Q5_K_S` + DFlash `Q4_K_M` | DFlash | `122.8k` | `turbo4/turbo3_tcq` | `1117.66` | `36.32` | `33.55s` | text-only quickstart-style run |\n\nFlags tested:\n\n- `--spec-autotune` did not produce better results on this workload\n- `--mtp-requantize-output-tensor q6_K` had occasional upside, about `+5 tok/s` decode in the best run, but it was not stable enough to justify the extra `~1 GiB` VRAM\n\n## Flag comparison\n\nThese are the high-level config differences that mattered most.\n\n| Backend | Quant(s) | Draft / spec mode | Key draft params | KV cache | Other notable flags |\n| --- | --- | --- | --- | --- | --- |\n| `ik_llama.cpp` | target `IQ4_KS` MTP | built-in `--multi-token-prediction` | `--draft-max 4`, `--draft-p-min 0.0` | `q8_0/q8_0` | `--merge-qkv`, `--merge-up-gate-experts`, `--ctx-checkpoints 32`, CPU `mmproj` |\n| `llama.cpp` upstream | target `UD-Q4_K_XL` | `draft-mtp` | `--spec-draft-n-max 6`, `--spec-draft-p-min 0.75` | `q4_0/q4_0` default, `q8_0/q8_0` tuned | `--flash-attn on`, `--jinja` |\n| `beellama.cpp` | target `Q5_K_S`, draft `Q4_K_M` | `dflash` | `--spec-dflash-cross-ctx 1024` | `turbo4/turbo3_tcq` | `--kv-unified`, `-b 2048`, `-ub 256`, text-only in my run |\n\n## Links\n\n- `ik_llama.cpp`: https://github.com/ikawrakow/ik_llama.cpp\n- `ExLlamaV3`: https://github.com/turboderp-org/exllamav3\n- BeeLlama: https://github.com/Anbeeld/beellama.cpp\n- BeeLlama Qwen 3.6 quickstart: https://github.com/Anbeeld/beellama.cpp/blob/main/docs/quickstart-qwen36-dflash.md\n- `club-3090`: https://github.com/noonghunna/club-3090\n- `IQ4_KS` with MTP: https://huggingface.co/ubergarm/Qwen3.6-27B-GGUF/blob/main/Qwen3.6-27B-MTP-IQ4_KS.gguf\n- `Qwen-3.6 quants` discussion: https://github.com/ikawrakow/ik_llama.cpp/discussions/1663\n- `IQ4_KS` quant family discussion: https://github.com/ikawrakow/ik_llama.cpp/discussions/8\n\n***\n\nThis is the best `24 GB` setup I found so far, but things are moving fast and I do not think this is settled yet.\n\nThe point of this thread is to compare real single-3090 / `24 GB` results: backend choice, quants, flags, and what stays stable under actual use.\n\nI would like this to become a useful reference thread for `24 GB` cards: what works, what breaks, and what is actually worth running day to day. I have not tested `ExLlamaV3` yet, and there may be other setups that are better.\n\nAlso, thanks to everyone building this stuff: backend authors, quant makers, template tinkerers, and the people doing the boring debugging work that makes local LLMs usable.\n",
+      "author_fullname": "t2_2gj894ei",
+      "saved": false,
+      "mod_reason_title": null,
+      "gilded": 0,
+      "clicked": false,
+      "title": "Qwen 3.6 27B on 24GB VRAM setup: backend comparisons, quant choice and settings (llama.cpp, ik_llama.cpp, BeeLlama, vllm)",
+      "link_flair_richtext": [
+        {
+          "e": "text",
+          "t": "Discussion"
+        }
+      ],
+      "subreddit_name_prefixed": "r/LocalLLaMA",
+      "hidden": false,
+      "pwls": 6,
+      "link_flair_css_class": "",
+      "downs": 0,
+      "thumbnail_height": null,
+      "top_awarded_type": null,
+      "hide_score": false,
+      "name": "t3_1tgis7s",
+      "quarantine": false,
+      "link_flair_text_color": "light",
+      "upvote_ratio": 0.95,
+      "author_flair_background_color": null,
+      "subreddit_type": "public",
+      "ups": 222,
+      "total_awards_received": 0,
+      "media_embed": {},
+      "thumbnail_width": null,
+      "author_flair_template_id": null,
+      "is_original_content": false,
+      "user_reports": [],
+      "secure_media": null,
+      "is_reddit_media_domain": false,
+      "is_meta": false,
+      "category": null,
+      "secure_media_embed": {},
+      "link_flair_text": "Discussion",
+      "can_mod_post": false,
+      "score": 222,
+      "approved_by": null,
+      "is_created_from_ads_ui": false,
+      "author_premium": false,
+      "thumbnail": "self",
+      "edited": 1779101682.0,
+      "author_flair_css_class": null,
+      "author_flair_richtext": [],
+      "gildings": {},
+      "post_hint": "self",
+      "content_categories": null,
+      "is_self": true,
+      "mod_note": null,
+      "created": 1779101003.0,
+      "link_flair_type": "richtext",
+      "wls": 6,
+      "removed_by_category": null,
+      "banned_by": null,
+      "author_flair_type": "text",
+      "domain": "self.LocalLLaMA",
+      "allow_live_comments": false,
+      "selftext_html": "&lt;!-- SC_OFF --&gt;&lt;div class=\"md\"&gt;&lt;h2&gt;TL;DR&lt;/h2&gt;\n\n&lt;ul&gt;\n&lt;li&gt;best setup I tested on a RTX 3090 24 GB: &lt;code&gt;ik_llama.cpp&lt;/code&gt; + &lt;code&gt;Qwen3.6-27B-MTP-IQ4_KS.gguf&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;156k&lt;/code&gt; context, &lt;code&gt;q8_0/q8_0&lt;/code&gt; KV, MTP, vision on CPU&lt;/li&gt;\n&lt;li&gt;benchmark result on a &lt;code&gt;~5.9k&lt;/code&gt; prompt + &lt;code&gt;1k&lt;/code&gt; output: about &lt;code&gt;1261 tok/s&lt;/code&gt; prefill, &lt;code&gt;72.9 tok/s&lt;/code&gt; decode&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;llama.cpp&lt;/code&gt; was a good start, BeeLlama worth testing, but &lt;code&gt;ik_llama.cpp&lt;/code&gt; performed the best&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;h2&gt;What was tested&lt;/h2&gt;\n\n&lt;ul&gt;\n&lt;li&gt;upstream &lt;code&gt;llama.cpp&lt;/code&gt;: easy baseline and a good place to start&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;beellama.cpp&lt;/code&gt;: promising on paper, but I could not reproduce the expected speed on my setup&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;ik_llama.cpp&lt;/code&gt;: best decode/prefill, best VRAM fit&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;I also spent time with &lt;code&gt;vLLM&lt;/code&gt; / &lt;code&gt;club-3090&lt;/code&gt;, but I am leaving it out of the table because I did not finish a clean apples-to-apples run in this batch. We were seeing about &lt;code&gt;78 tok/s&lt;/code&gt; on responses, but the high-context OOM cliffs were too flaky, so I dropped it until that is fixed. I have not tested it recently, but the repo still flags the single-card long-context issue as unresolved.&lt;/p&gt;\n\n&lt;h2&gt;The benchmark&lt;/h2&gt;\n\n&lt;p&gt;One-shot chat-completion task:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;prompt size: about &lt;code&gt;5.9k&lt;/code&gt; tokens&lt;/li&gt;\n&lt;li&gt;output size: &lt;code&gt;1024&lt;/code&gt; tokens&lt;/li&gt;\n&lt;li&gt;task shape: a code-review / migration note over local setup files&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;So it mostly tests:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;prefill speed on a medium-large real prompt&lt;/li&gt;\n&lt;li&gt;decode speed on a sustained &lt;code&gt;1k&lt;/code&gt;-token generation&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;So that is not best-case tok/s, but closer to reality.&lt;/p&gt;\n\n&lt;h2&gt;The setup I kept&lt;/h2&gt;\n\n&lt;p&gt;This is the profile I kept as my default:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;backend: &lt;a href=\"https://github.com/ikawrakow/ik_llama.cpp\"&gt;&lt;code&gt;ikawrakow/ik_llama.cpp&lt;/code&gt;&lt;/a&gt;&lt;/li&gt;\n&lt;li&gt;current tested build: &lt;code&gt;4507 (c35189d8)&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;model: &lt;a href=\"https://huggingface.co/ubergarm/Qwen3.6-27B-GGUF\"&gt;&lt;code&gt;ubergarm/Qwen3.6-27B-GGUF&lt;/code&gt;&lt;/a&gt;&lt;/li&gt;\n&lt;li&gt;direct model file: &lt;a href=\"https://huggingface.co/ubergarm/Qwen3.6-27B-GGUF/blob/main/Qwen3.6-27B-MTP-IQ4_KS.gguf\"&gt;&lt;code&gt;Qwen3.6-27B-MTP-IQ4_KS.gguf&lt;/code&gt;&lt;/a&gt;&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;High-level launch shape:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;&lt;code&gt;--ctx-size 156000&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;--cache-type-k q8_0&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;--cache-type-v q8_0&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;--flash-attn on&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;--multi-token-prediction&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;--draft-max 4&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;--draft-p-min 0.0&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;--merge-qkv&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;--merge-up-gate-experts&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;--cache-ram 32768&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;--ctx-checkpoints 32&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;--reasoning on&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;--reasoning-format deepseek&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;--chat-template-kwargs &amp;#39;{&amp;quot;preserve_thinking&amp;quot;:true}&amp;#39;&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;--no-mmproj-offload&lt;/code&gt;&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;Notes:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;built-in MTP in &lt;code&gt;ik_llama.cpp&lt;/code&gt; worked better for me than the other speculative paths&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;q8_0&lt;/code&gt; KV was good quality; you can opt into &lt;code&gt;q4&lt;/code&gt;, but there is plenty of VRAM headroom with &lt;code&gt;IQ4_KS&lt;/code&gt;&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;h2&gt;Why &lt;code&gt;IQ4_KS&lt;/code&gt;&lt;/h2&gt;\n\n&lt;ul&gt;\n&lt;li&gt;much smaller than Unsloth &lt;code&gt;UD-Q4_K_XL&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;quality stayed high enough that I did not feel a real penalty&lt;/li&gt;\n&lt;li&gt;on a &lt;code&gt;24 GB&lt;/code&gt; card, those saved GiB matter once you start pushing context and sane u-batch sizes&lt;/li&gt;\n&lt;li&gt;to be fair, there is probably room for a higher quant, maybe &lt;code&gt;q5&lt;/code&gt;; I have not tested that yet&lt;/li&gt;\n&lt;li&gt;&lt;a href=\"https://github.com/ikawrakow/ik_llama.cpp/discussions/1663\"&gt;&lt;code&gt;Qwen-3.6 quants&lt;/code&gt; discussion #1663&lt;/a&gt;&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;TLDR:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;&lt;code&gt;Qwen 3.6&lt;/code&gt; quantizes very well in &lt;code&gt;IQ4_KS&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;ikawrakow&lt;/code&gt; measured &lt;code&gt;IQ4_KS&lt;/code&gt; as very close to, or better than, &lt;code&gt;UD_Q4_XL&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;Unsloth &lt;code&gt;UD-Q4_K_XL&lt;/code&gt; needs about &lt;code&gt;2.8 GiB&lt;/code&gt; more to land in the same neighborhood&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;If you want the background on the quant family itself:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;&lt;a href=\"https://github.com/ikawrakow/ik_llama.cpp/discussions/8\"&gt;&lt;code&gt;New quantization types IQ2_K, IQ3_K, IQ4_K, IQ5_K&lt;/code&gt; discussion #8&lt;/a&gt;&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;h2&gt;Vision&lt;/h2&gt;\n\n&lt;ul&gt;\n&lt;li&gt;projector on CPU by default: &lt;code&gt;--mmproj ...&lt;/code&gt; + &lt;code&gt;--no-mmproj-offload&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;move it to GPU if you want faster image processing and are willing to spend roughly &lt;code&gt;1.5 GiB&lt;/code&gt; more VRAM&lt;/li&gt;\n&lt;li&gt;if that OOMs, lower context or switch to &lt;code&gt;q4&lt;/code&gt; KV&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;h2&gt;GPU Stuff&lt;/h2&gt;\n\n&lt;p&gt;This was on Linux with the desktop on the iGPU and the RTX 3090 used only for LLMs.&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;power limit: &lt;code&gt;330 W&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;memory OC: &lt;code&gt;+600&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;undervolt: flattened at about &lt;code&gt;1875 MHz @ 868 mV&lt;/code&gt; (&lt;code&gt;LACT&lt;/code&gt; now has a curve editor)&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;h2&gt;Some experiments did not make the default setup better&lt;/h2&gt;\n\n&lt;ul&gt;\n&lt;li&gt;&lt;code&gt;--spec-autotune&lt;/code&gt; on &lt;code&gt;ik_llama.cpp&lt;/code&gt;: no meaningful gain on this workload&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;--mtp-requantize-output-tensor q6_K&lt;/code&gt;: sometimes faster, but inconsistent and costs about &lt;code&gt;1 GiB&lt;/code&gt; extra VRAM, so I did not keep it&lt;/li&gt;\n&lt;li&gt;BeeLlama DFlash precision quickstart: loaded fine, but was much slower here than expected&lt;/li&gt;\n&lt;li&gt;upstream &lt;code&gt;llama.cpp&lt;/code&gt; MTP paths: good baseline, but slower than &lt;code&gt;ik_llama.cpp&lt;/code&gt; in my tests&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;BeeLlama and &lt;code&gt;vLLM&lt;/code&gt; are still worth exploring. I just did not land on a setup there that beat the &lt;code&gt;ik_llama.cpp&lt;/code&gt; profile for my workload.&lt;/p&gt;\n\n&lt;h2&gt;Results&lt;/h2&gt;\n\n&lt;p&gt;These are the useful comparison points from the same real prompt / &lt;code&gt;1024&lt;/code&gt;-token output benchmark.&lt;/p&gt;\n\n&lt;table&gt;&lt;thead&gt;\n&lt;tr&gt;\n&lt;th&gt;Backend&lt;/th&gt;\n&lt;th&gt;Model / quant&lt;/th&gt;\n&lt;th&gt;Spec path&lt;/th&gt;\n&lt;th align=\"right\"&gt;Context&lt;/th&gt;\n&lt;th&gt;KV cache&lt;/th&gt;\n&lt;th align=\"right\"&gt;Prefill tok/s&lt;/th&gt;\n&lt;th align=\"right\"&gt;Decode tok/s&lt;/th&gt;\n&lt;th align=\"right\"&gt;Wall time&lt;/th&gt;\n&lt;th&gt;Notes&lt;/th&gt;\n&lt;/tr&gt;\n&lt;/thead&gt;&lt;tbody&gt;\n&lt;tr&gt;\n&lt;td&gt;&lt;code&gt;ik_llama.cpp&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;&lt;code&gt;Qwen3.6-27B-MTP-IQ4_KS&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;built-in MTP&lt;/td&gt;\n&lt;td align=\"right\"&gt;&lt;code&gt;156k&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;&lt;code&gt;q8_0/q8_0&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"right\"&gt;&lt;code&gt;1260.95&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"right\"&gt;&lt;code&gt;72.93&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"right\"&gt;&lt;code&gt;18.79s&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;best overall default profile&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td&gt;&lt;code&gt;llama.cpp&lt;/code&gt; upstream&lt;/td&gt;\n&lt;td&gt;&lt;code&gt;Qwen3.6-27B-UD-Q4_K_XL&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;&lt;code&gt;draft-mtp&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"right\"&gt;&lt;code&gt;32k&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;&lt;code&gt;q4_0/q4_0&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"right\"&gt;&lt;code&gt;1247.65&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"right\"&gt;&lt;code&gt;51.20&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"right\"&gt;&lt;code&gt;24.80s&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;easiest starting point&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td&gt;&lt;code&gt;llama.cpp&lt;/code&gt; upstream tuned&lt;/td&gt;\n&lt;td&gt;&lt;code&gt;Qwen3.6-27B-UD-Q4_K_XL&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;&lt;code&gt;draft-mtp&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"right\"&gt;&lt;code&gt;32k&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;&lt;code&gt;q8_0/q8_0&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"right\"&gt;&lt;code&gt;1242.81&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"right\"&gt;&lt;code&gt;56.66&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"right\"&gt;&lt;code&gt;22.88s&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;old-like flags helped, still slower&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td&gt;&lt;code&gt;beellama.cpp&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;&lt;code&gt;Q5_K_S&lt;/code&gt; + DFlash &lt;code&gt;Q4_K_M&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;DFlash&lt;/td&gt;\n&lt;td align=\"right\"&gt;&lt;code&gt;122.8k&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;&lt;code&gt;turbo4/turbo3_tcq&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"right\"&gt;&lt;code&gt;1117.66&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"right\"&gt;&lt;code&gt;36.32&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"right\"&gt;&lt;code&gt;33.55s&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;text-only quickstart-style run&lt;/td&gt;\n&lt;/tr&gt;\n&lt;/tbody&gt;&lt;/table&gt;\n\n&lt;p&gt;Flags tested:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;&lt;code&gt;--spec-autotune&lt;/code&gt; did not produce better results on this workload&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;--mtp-requantize-output-tensor q6_K&lt;/code&gt; had occasional upside, about &lt;code&gt;+5 tok/s&lt;/code&gt; decode in the best run, but it was not stable enough to justify the extra &lt;code&gt;~1 GiB&lt;/code&gt; VRAM&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;h2&gt;Flag comparison&lt;/h2&gt;\n\n&lt;p&gt;These are the high-level config differences that mattered most.&lt;/p&gt;\n\n&lt;table&gt;&lt;thead&gt;\n&lt;tr&gt;\n&lt;th&gt;Backend&lt;/th&gt;\n&lt;th&gt;Quant(s)&lt;/th&gt;\n&lt;th&gt;Draft / spec mode&lt;/th&gt;\n&lt;th&gt;Key draft params&lt;/th&gt;\n&lt;th&gt;KV cache&lt;/th&gt;\n&lt;th&gt;Other notable flags&lt;/th&gt;\n&lt;/tr&gt;\n&lt;/thead&gt;&lt;tbody&gt;\n&lt;tr&gt;\n&lt;td&gt;&lt;code&gt;ik_llama.cpp&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;target &lt;code&gt;IQ4_KS&lt;/code&gt; MTP&lt;/td&gt;\n&lt;td&gt;built-in &lt;code&gt;--multi-token-prediction&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;&lt;code&gt;--draft-max 4&lt;/code&gt;, &lt;code&gt;--draft-p-min 0.0&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;&lt;code&gt;q8_0/q8_0&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;&lt;code&gt;--merge-qkv&lt;/code&gt;, &lt;code&gt;--merge-up-gate-experts&lt;/code&gt;, &lt;code&gt;--ctx-checkpoints 32&lt;/code&gt;, CPU &lt;code&gt;mmproj&lt;/code&gt;&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td&gt;&lt;code&gt;llama.cpp&lt;/code&gt; upstream&lt;/td&gt;\n&lt;td&gt;target &lt;code&gt;UD-Q4_K_XL&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;&lt;code&gt;draft-mtp&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;&lt;code&gt;--spec-draft-n-max 6&lt;/code&gt;, &lt;code&gt;--spec-draft-p-min 0.75&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;&lt;code&gt;q4_0/q4_0&lt;/code&gt; default, &lt;code&gt;q8_0/q8_0&lt;/code&gt; tuned&lt;/td&gt;\n&lt;td&gt;&lt;code&gt;--flash-attn on&lt;/code&gt;, &lt;code&gt;--jinja&lt;/code&gt;&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td&gt;&lt;code&gt;beellama.cpp&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;target &lt;code&gt;Q5_K_S&lt;/code&gt;, draft &lt;code&gt;Q4_K_M&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;&lt;code&gt;dflash&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;&lt;code&gt;--spec-dflash-cross-ctx 1024&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;&lt;code&gt;turbo4/turbo3_tcq&lt;/code&gt;&lt;/td&gt;\n&lt;td&gt;&lt;code&gt;--kv-unified&lt;/code&gt;, &lt;code&gt;-b 2048&lt;/code&gt;, &lt;code&gt;-ub 256&lt;/code&gt;, text-only in my run&lt;/td&gt;\n&lt;/tr&gt;\n&lt;/tbody&gt;&lt;/table&gt;\n\n&lt;h2&gt;Links&lt;/h2&gt;\n\n&lt;ul&gt;\n&lt;li&gt;&lt;code&gt;ik_llama.cpp&lt;/code&gt;: &lt;a href=\"https://github.com/ikawrakow/ik_llama.cpp\"&gt;https://github.com/ikawrakow/ik_llama.cpp&lt;/a&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;ExLlamaV3&lt;/code&gt;: &lt;a href=\"https://github.com/turboderp-org/exllamav3\"&gt;https://github.com/turboderp-org/exllamav3&lt;/a&gt;&lt;/li&gt;\n&lt;li&gt;BeeLlama: &lt;a href=\"https://github.com/Anbeeld/beellama.cpp\"&gt;https://github.com/Anbeeld/beellama.cpp&lt;/a&gt;&lt;/li&gt;\n&lt;li&gt;BeeLlama Qwen 3.6 quickstart: &lt;a href=\"https://github.com/Anbeeld/beellama.cpp/blob/main/docs/quickstart-qwen36-dflash.md\"&gt;https://github.com/Anbeeld/beellama.cpp/blob/main/docs/quickstart-qwen36-dflash.md&lt;/a&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;club-3090&lt;/code&gt;: &lt;a href=\"https://github.com/noonghunna/club-3090\"&gt;https://github.com/noonghunna/club-3090&lt;/a&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;IQ4_KS&lt;/code&gt; with MTP: &lt;a href=\"https://huggingface.co/ubergarm/Qwen3.6-27B-GGUF/blob/main/Qwen3.6-27B-MTP-IQ4_KS.gguf\"&gt;https://huggingface.co/ubergarm/Qwen3.6-27B-GGUF/blob/main/Qwen3.6-27B-MTP-IQ4_KS.gguf&lt;/a&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;Qwen-3.6 quants&lt;/code&gt; discussion: &lt;a href=\"https://github.com/ikawrakow/ik_llama.cpp/discussions/1663\"&gt;https://github.com/ikawrakow/ik_llama.cpp/discussions/1663&lt;/a&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;IQ4_KS&lt;/code&gt; quant family discussion: &lt;a href=\"https://github.com/ikawrakow/ik_llama.cpp/discussions/8\"&gt;https://github.com/ikawrakow/ik_llama.cpp/discussions/8&lt;/a&gt;&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;hr/&gt;\n\n&lt;p&gt;This is the best &lt;code&gt;24 GB&lt;/code&gt; setup I found so far, but things are moving fast and I do not think this is settled yet.&lt;/p&gt;\n\n&lt;p&gt;The point of this thread is to compare real single-3090 / &lt;code&gt;24 GB&lt;/code&gt; results: backend choice, quants, flags, and what stays stable under actual use.&lt;/p&gt;\n\n&lt;p&gt;I would like this to become a useful reference thread for &lt;code&gt;24 GB&lt;/code&gt; cards: what works, what breaks, and what is actually worth running day to day. I have not tested &lt;code&gt;ExLlamaV3&lt;/code&gt; yet, and there may be other setups that are better.&lt;/p&gt;\n\n&lt;p&gt;Also, thanks to everyone building this stuff: backend authors, quant makers, template tinkerers, and the people doing the boring debugging work that makes local LLMs usable.&lt;/p&gt;\n&lt;/div&gt;&lt;!-- SC_ON --&gt;",
+      "likes": null,
+      "suggested_sort": null,
+      "banned_at_utc": null,
+      "view_count": null,
+      "archived": false,
+      "no_follow": false,
+      "is_crosspostable": false,
+      "pinned": false,
+      "over_18": false,
+      "preview": {
+        "images": [
+          {
+            "source": {
+              "url": "https://external-preview.redd.it/SGkQi5z-sTShhdvNI9LBAWcbro6m_l5PzWM3EFDIi7s.png?auto=webp&amp;s=ee32967bfe996541cd634429c9c62e366c84a637",
+              "width": 1200,
+              "height": 600
+            },
+            "resolutions": [
+              {
+                "url": "https://external-preview.redd.it/SGkQi5z-sTShhdvNI9LBAWcbro6m_l5PzWM3EFDIi7s.png?width=108&amp;crop=smart&amp;auto=webp&amp;s=5f9c999c40522ecc8c020f8a5d204a51c8e4977e",
+                "width": 108,
+                "height": 54
+              },
+              {
+                "url": "https://external-preview.redd.it/SGkQi5z-sTShhdvNI9LBAWcbro6m_l5PzWM3EFDIi7s.png?width=216&amp;crop=smart&amp;auto=webp&amp;s=f382167ad13e4a566e73547db3143bdee475d807",
+                "width": 216,
+                "height": 108
+              },
+              {
+                "url": "https://external-preview.redd.it/SGkQi5z-sTShhdvNI9LBAWcbro6m_l5PzWM3EFDIi7s.png?width=320&amp;crop=smart&amp;auto=webp&amp;s=87098161ae32e27544969023498777b69796de3b",
+                "width": 320,
+                "height": 160
+              },
+              {
+                "url": "https://external-preview.redd.it/SGkQi5z-sTShhdvNI9LBAWcbro6m_l5PzWM3EFDIi7s.png?width=640&amp;crop=smart&amp;auto=webp&amp;s=e91761516671a8a4efca9d0f09ec16fa6b815e6f",
+                "width": 640,
+                "height": 320
+              },
+              {
+                "url": "https://external-preview.redd.it/SGkQi5z-sTShhdvNI9LBAWcbro6m_l5PzWM3EFDIi7s.png?width=960&amp;crop=smart&amp;auto=webp&amp;s=c5b752ccf93327f1f1a6e47d9b34e5428ef0cd76",
+                "width": 960,
+                "height": 480
+              },
+              {
+                "url": "https://external-preview.redd.it/SGkQi5z-sTShhdvNI9LBAWcbro6m_l5PzWM3EFDIi7s.png?width=1080&amp;crop=smart&amp;auto=webp&amp;s=0f1f06d5f1f821f9d496c319a79fd2ae86a8a02b",
+                "width": 1080,
+                "height": 540
+              }
+            ],
+            "variants": {},
+            "id": "SGkQi5z-sTShhdvNI9LBAWcbro6m_l5PzWM3EFDIi7s"
+          }
+        ],
+        "enabled": false
+      },
+      "all_awardings": [],
+      "awarders": [],
+      "media_only": false,
+      "link_flair_template_id": "5f921ea4-c7bc-11ed-9c23-3a00622979b4",
+      "can_gild": false,
+      "spoiler": false,
+      "locked": false,
+      "author_flair_text": null,
+      "treatment_tags": [],
+      "visited": false,
+      "removed_by": null,
+      "num_reports": null,
+      "distinguished": null,
+      "subreddit_id": "t5_81eyvm",
+      "author_is_blocked": false,
+      "mod_reason_by": null,
+      "removal_reason": null,
+      "link_flair_background_color": "#646d73",
+      "id": "1tgis7s",
+      "is_robot_indexable": true,
+      "report_reasons": null,
+      "author": "VolandBerlioz",
+      "discussion_type": null,
+      "num_comments": 136,
+      "send_replies": true,
+      "contest_mode": false,
+      "mod_reports": [],
+      "author_patreon_flair": false,
+      "author_flair_text_color": null,
+      "permalink": "/r/LocalLLaMA/comments/1tgis7s/qwen_36_27b_on_24gb_vram_setup_backend/",
+      "stickied": false,
+      "url": "https://www.reddit.com/r/LocalLLaMA/comments/1tgis7s/qwen_36_27b_on_24gb_vram_setup_backend/",
+      "subreddit_subscribers": 742102,
+      "created_utc": 1779101003.0,
+      "num_crossposts": 2,
+      "media": null,
+      "is_video": false
+    }
+  },
+  {
+    "kind": "t3",
+    "data": {
+      "approved_at_utc": null,
+      "subreddit": "LocalLLaMA",
+      "selftext": "My first post here since I benefit a lot from reading. Bought 5060ti 16gb and tried various model.\n\nThis is the short version for me deciding what to run on this card with `llama.cpp`, not a giant benchmark dump.\n\nMachine:\n\n* RTX 5060 Ti 16 GB\n* DDR4 now at 32 GB\n* llama-server `b8373` (`46dba9fce`)\n\nRelevant launch settings:\n\n* fast path: `fa=on`, `ngl=auto`, `threads=8`\n* KV: `-ctk q8_0 -ctv q8_0`\n* 30B coder path: `jinja`, `reasoning-budget 0`, `reasoning-format none`\n* 35B UD path: `c=262144`, `n-cpu-moe=8`\n* 35B `Q4_K_M` stable tune: `-ngl 26 -c 131072 --fit on --fit-ctx 131072 --fit-target 512M`\n\nShort version:\n\n* Best default coding model: `Unsloth Qwen3-Coder-30B UD-Q3_K_XL`\n* Best higher-context coding option: the same `Unsloth 30B` model at `96k`\n* Best fast 35B coding option: `Unsloth Qwen3.5-35B UD-Q2_K_XL`\n* `Unsloth Qwen3.5-35B Q4_K_M` is interesting, but still not the right default on this card\n\nWhat surprised me most is that the practical winners here were not just \u201csmaller is faster\u201d. On this machine, the strongest real-world picks were still the `30B` coder profile and the older `35B UD-Q2_K_XL` path, not the smaller `9B` route and not the heavier `35B Q4_K_M` experiment.\n\nQuick size / quant snapshot from the local data:\n\n* `Jackrong Qwen 3.5 4B Q5_K_M`: `88 tok/s`\n* `LuffyTheFox Qwen 3.5 9B Q4_K_M`: `64 tok/s`\n* `Jackrong Qwen 3.5 27B Q3_K_S`: `~20 tok/s`\n* `Unsloth Qwen 3.0 30B UD-Q3_K_XL`: `76.3 tok/s`\n* `Unsloth Qwen 3.5 35B UD-Q2_K_XL`: `80.1 tok/s`\n\nMatched Windows vs Ubuntu shortlist test:\n\n* same 20 questions\n* same `32k` context\n* same `max_tokens=800`\n\nResults:\n\n* `Unsloth Qwen3-Coder-30B UD-Q3_K_XL`\n   * Windows: `79.5 tok/s`, load time `7.94`\n   * Ubuntu: `76.3 tok/s`, load time `8.14`\n* `Unsloth Qwen3.5-35B UD-Q2_K_XL`\n   * Windows: `72.3 tok/s`, load time `7.40`\n   * Ubuntu: `80.1 tok/s`, load time `7.39`\n* `Jackrong Qwen3.5-27B Claude-Opus Distilled Q3_K_S`\n   * Windows: `19.9 tok/s`, load time `8.85`\n   * Ubuntu: `~20.0 tok/s`, load time `8.21`\n\nThat left the picture pretty clean:\n\n* `Unsloth Qwen 3.0 30B` is still the safest main recommendation\n* `Unsloth Qwen 3.5 35B UD-Q2_K_XL` is still the only 35B option here that actually feels fast\n* `Jackrong Qwen 3.5 27B` stays in the slower quality-first tier\n\nThe 35B `Q4_K_M` result is the main cautionary note.\n\nI was able to make `Unsloth Qwen3.5-35B-A3B Q4_K_M` stable on this card with:\n\n* `-ngl 26`\n* `-c 131072`\n* `-ctk q8_0 -ctv q8_0`\n* `--fit on --fit-ctx 131072 --fit-target 512M`\n\nBut even with that tuning, it still did not beat the older `Unsloth UD-Q2_K_XL` path in practical use.\n\nI also rechecked whether llama.cpp defaults were causing the odd Ubuntu result on `Jackrong 27B`. They were not.\n\nFocused sweep on Ubuntu:\n\n* `-fa on`, auto parallel: `19.95 tok/s`\n* `-fa auto`, auto parallel: `19.56 tok/s`\n* `-fa on`, `--parallel 1`: `19.26 tok/s`\n\nSo for that model:\n\n* `flash-attn on` vs `auto` barely changed anything\n* auto server parallel vs `parallel=1` barely changed anything\n\nModel links:\n\n* Unsloth Qwen3-Coder-30B-A3B-Instruct-GGUF: [https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF](https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF)\n* Unsloth Qwen3.5-35B-A3B-GGUF: [https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF](https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF)\n* Jackrong Qwen3.5-27B Claude-4.6 Opus Reasoning Distilled GGUF: [https://huggingface.co/Jackrong/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-GGUF](https://huggingface.co/Jackrong/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-GGUF)\n* HauhauCS Qwen3.5-27B Uncensored Aggressive: [https://huggingface.co/HauhauCS/Qwen3.5-27B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-27B-Uncensored-HauhauCS-Aggressive)\n* Jackrong Qwen3.5-4B Claude-4.6 Opus Reasoning Distilled GGUF: [https://huggingface.co/Jackrong/Qwen3.5-4B-Claude-4.6-Opus-Reasoning-Distilled-GGUF](https://huggingface.co/Jackrong/Qwen3.5-4B-Claude-4.6-Opus-Reasoning-Distilled-GGUF)\n* LuffyTheFox Qwen3.5-9B Claude-4.6 Opus Uncensored Distilled GGUF: [https://huggingface.co/LuffyTheFox/Qwen3.5-9B-Claude-4.6-Opus-Uncensored-Distilled-GGUF](https://huggingface.co/LuffyTheFox/Qwen3.5-9B-Claude-4.6-Opus-Uncensored-Distilled-GGUF)\n\nBottom line:\n\n* `Unsloth 30B coder` is still the best practical recommendation for a `5060 Ti 16 GB`\n* `Unsloth 30B @ 96k` is the upgrade path if you need more context\n* `Unsloth 35B UD-Q2_K_XL` is still the fast 35B coding option\n* `Unsloth 35B Q4_K_M` is useful to experiment with, but I would not daily-drive it on this hardware\n\nQuick update since the original follow-up (22-Mar):\n\nI reran `Qwen3.5-35B-A3B Q4_K_M` apples-to-apples with the same quant and only changed the runtime/offload path.\n\n|Model|Runtime|Flags|Score|Prompt tok/s|Decode tok/s|\n|:-|:-|:-|:-|:-|:-|\n|Qwen3.5-35B-A3B `Q4_K_M`|upstream `llama.cpp`|isolated retest|`16/22`|`113.26`|`26.24`|\n|Qwen3.5-35B-A3B `Q4_K_M`|`ik_llama.cpp`|`--n-cpu-moe 16`|`22/22`|`262.40`|`61.28`|\n\nFor reference:\n\n|Model|Runtime|Flags|Score|Prompt tok/s|Decode tok/s|\n|:-|:-|:-|:-|:-|:-|\n|Qwen3.5-35B-A3B `Q5_K_M`|upstream `llama.cpp`|`--cpu-moe`|`22/22`|`65.94`|`34.29`|\n\nTakeaway:\n\n* the big jump was not `Q5` vs `Q4`\n* it was runtime/offload strategy\n* same `Q4_K_M` went from `16/22` to `22/22`\n* and got much faster at the same time\n\nCurrent best 35B setup on this machine:\n\n* `Qwen3.5-35B-A3B Q4_K_M`\n* `ik_llama.cpp`\n* `--n-cpu-moe 16`\n\nUpdated bottom line:\n\n* Qwen3.5-35B-A3B Q4\\_K\\_M on ik\\_llama.cpp --n-cpu-moe 16 is now the best practical recommendation on this 5060 Ti 16GB for the harder coding benchmark\n* Unsloth 30B coder is no longer the top recommendation on this test set\n* Unsloth 30B @ 96k can still make sense if your main need is longer context, but it is no longer the best overall coding pick here\n* Unsloth 35B UD-Q2\\_K\\_XL is no longer the most interesting fast 35B option\n* Unsloth 35B Q4\\_K\\_M is no longer just an experiment - with the right runtime/offload path, it is now the strongest 35B setup you\u2019ve tested locally",
+      "author_fullname": "t2_93g5crh6",
+      "saved": false,
+      "mod_reason_title": null,
+      "gilded": 0,
+      "clicked": false,
+      "title": "RTX 5060 Ti 16GB Local LLM Findings: 30B Still Wins, 35B UD Is Surprisingly Fast",
+      "link_flair_richtext": [
+        {
+          "e": "text",
+          "t": "Resources"
+        }
+      ],
+      "subreddit_name_prefixed": "r/LocalLLaMA",
+      "hidden": false,
+      "pwls": 6,
+      "link_flair_css_class": "",
+      "downs": 0,
+      "thumbnail_height": 140,
+      "top_awarded_type": null,
+      "hide_score": false,
+      "name": "t3_1ryze51",
+      "quarantine": false,
+      "link_flair_text_color": "light",
+      "upvote_ratio": 0.9,
+      "author_flair_background_color": null,
+      "ups": 31,
+      "total_awards_received": 0,
+      "media_embed": {},
+      "thumbnail_width": 140,
+      "author_flair_template_id": null,
+      "is_original_content": false,
+      "user_reports": [],
+      "secure_media": null,
+      "is_reddit_media_domain": true,
+      "is_meta": false,
+      "category": null,
+      "secure_media_embed": {},
+      "link_flair_text": "Resources",
+      "can_mod_post": false,
+      "score": 31,
+      "approved_by": null,
+      "is_created_from_ads_ui": false,
+      "author_premium": false,
+      "thumbnail": "https://preview.redd.it/r07aacodx7qg1.png?width=140&amp;height=140&amp;crop=1:1,smart&amp;auto=webp&amp;s=6e06a8d465f1348105fcad5cce043a4078068ead",
+      "edited": 1774202743.0,
+      "author_flair_css_class": null,
+      "author_flair_richtext": [],
+      "gildings": {},
+      "post_hint": "image",
+      "content_categories": null,
+      "is_self": false,
+      "subreddit_type": "public",
+      "created": 1774020603.0,
+      "link_flair_type": "richtext",
+      "wls": 6,
+      "removed_by_category": null,
+      "banned_by": null,
+      "author_flair_type": "text",
+      "domain": "i.redd.it",
+      "allow_live_comments": false,
+      "selftext_html": "&lt;!-- SC_OFF --&gt;&lt;div class=\"md\"&gt;&lt;p&gt;My first post here since I benefit a lot from reading. Bought 5060ti 16gb and tried various model.&lt;/p&gt;\n\n&lt;p&gt;This is the short version for me deciding what to run on this card with &lt;code&gt;llama.cpp&lt;/code&gt;, not a giant benchmark dump.&lt;/p&gt;\n\n&lt;p&gt;Machine:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;RTX 5060 Ti 16 GB&lt;/li&gt;\n&lt;li&gt;DDR4 now at 32 GB&lt;/li&gt;\n&lt;li&gt;llama-server &lt;code&gt;b8373&lt;/code&gt; (&lt;code&gt;46dba9fce&lt;/code&gt;)&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;Relevant launch settings:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;fast path: &lt;code&gt;fa=on&lt;/code&gt;, &lt;code&gt;ngl=auto&lt;/code&gt;, &lt;code&gt;threads=8&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;KV: &lt;code&gt;-ctk q8_0 -ctv q8_0&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;30B coder path: &lt;code&gt;jinja&lt;/code&gt;, &lt;code&gt;reasoning-budget 0&lt;/code&gt;, &lt;code&gt;reasoning-format none&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;35B UD path: &lt;code&gt;c=262144&lt;/code&gt;, &lt;code&gt;n-cpu-moe=8&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;35B &lt;code&gt;Q4_K_M&lt;/code&gt; stable tune: &lt;code&gt;-ngl 26 -c 131072 --fit on --fit-ctx 131072 --fit-target 512M&lt;/code&gt;&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;Short version:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;Best default coding model: &lt;code&gt;Unsloth Qwen3-Coder-30B UD-Q3_K_XL&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;Best higher-context coding option: the same &lt;code&gt;Unsloth 30B&lt;/code&gt; model at &lt;code&gt;96k&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;Best fast 35B coding option: &lt;code&gt;Unsloth Qwen3.5-35B UD-Q2_K_XL&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;Unsloth Qwen3.5-35B Q4_K_M&lt;/code&gt; is interesting, but still not the right default on this card&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;What surprised me most is that the practical winners here were not just \u201csmaller is faster\u201d. On this machine, the strongest real-world picks were still the &lt;code&gt;30B&lt;/code&gt; coder profile and the older &lt;code&gt;35B UD-Q2_K_XL&lt;/code&gt; path, not the smaller &lt;code&gt;9B&lt;/code&gt; route and not the heavier &lt;code&gt;35B Q4_K_M&lt;/code&gt; experiment.&lt;/p&gt;\n\n&lt;p&gt;Quick size / quant snapshot from the local data:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;&lt;code&gt;Jackrong Qwen 3.5 4B Q5_K_M&lt;/code&gt;: &lt;code&gt;88 tok/s&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;LuffyTheFox Qwen 3.5 9B Q4_K_M&lt;/code&gt;: &lt;code&gt;64 tok/s&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;Jackrong Qwen 3.5 27B Q3_K_S&lt;/code&gt;: &lt;code&gt;~20 tok/s&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;Unsloth Qwen 3.0 30B UD-Q3_K_XL&lt;/code&gt;: &lt;code&gt;76.3 tok/s&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;Unsloth Qwen 3.5 35B UD-Q2_K_XL&lt;/code&gt;: &lt;code&gt;80.1 tok/s&lt;/code&gt;&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;Matched Windows vs Ubuntu shortlist test:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;same 20 questions&lt;/li&gt;\n&lt;li&gt;same &lt;code&gt;32k&lt;/code&gt; context&lt;/li&gt;\n&lt;li&gt;same &lt;code&gt;max_tokens=800&lt;/code&gt;&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;Results:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;&lt;code&gt;Unsloth Qwen3-Coder-30B UD-Q3_K_XL&lt;/code&gt;\n\n&lt;ul&gt;\n&lt;li&gt;Windows: &lt;code&gt;79.5 tok/s&lt;/code&gt;, load time &lt;code&gt;7.94&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;Ubuntu: &lt;code&gt;76.3 tok/s&lt;/code&gt;, load time &lt;code&gt;8.14&lt;/code&gt;&lt;/li&gt;\n&lt;/ul&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;Unsloth Qwen3.5-35B UD-Q2_K_XL&lt;/code&gt;\n\n&lt;ul&gt;\n&lt;li&gt;Windows: &lt;code&gt;72.3 tok/s&lt;/code&gt;, load time &lt;code&gt;7.40&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;Ubuntu: &lt;code&gt;80.1 tok/s&lt;/code&gt;, load time &lt;code&gt;7.39&lt;/code&gt;&lt;/li&gt;\n&lt;/ul&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;Jackrong Qwen3.5-27B Claude-Opus Distilled Q3_K_S&lt;/code&gt;\n\n&lt;ul&gt;\n&lt;li&gt;Windows: &lt;code&gt;19.9 tok/s&lt;/code&gt;, load time &lt;code&gt;8.85&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;Ubuntu: &lt;code&gt;~20.0 tok/s&lt;/code&gt;, load time &lt;code&gt;8.21&lt;/code&gt;&lt;/li&gt;\n&lt;/ul&gt;&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;That left the picture pretty clean:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;&lt;code&gt;Unsloth Qwen 3.0 30B&lt;/code&gt; is still the safest main recommendation&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;Unsloth Qwen 3.5 35B UD-Q2_K_XL&lt;/code&gt; is still the only 35B option here that actually feels fast&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;Jackrong Qwen 3.5 27B&lt;/code&gt; stays in the slower quality-first tier&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;The 35B &lt;code&gt;Q4_K_M&lt;/code&gt; result is the main cautionary note.&lt;/p&gt;\n\n&lt;p&gt;I was able to make &lt;code&gt;Unsloth Qwen3.5-35B-A3B Q4_K_M&lt;/code&gt; stable on this card with:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;&lt;code&gt;-ngl 26&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;-c 131072&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;-ctk q8_0 -ctv q8_0&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;--fit on --fit-ctx 131072 --fit-target 512M&lt;/code&gt;&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;But even with that tuning, it still did not beat the older &lt;code&gt;Unsloth UD-Q2_K_XL&lt;/code&gt; path in practical use.&lt;/p&gt;\n\n&lt;p&gt;I also rechecked whether llama.cpp defaults were causing the odd Ubuntu result on &lt;code&gt;Jackrong 27B&lt;/code&gt;. They were not.&lt;/p&gt;\n\n&lt;p&gt;Focused sweep on Ubuntu:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;&lt;code&gt;-fa on&lt;/code&gt;, auto parallel: &lt;code&gt;19.95 tok/s&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;-fa auto&lt;/code&gt;, auto parallel: &lt;code&gt;19.56 tok/s&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;-fa on&lt;/code&gt;, &lt;code&gt;--parallel 1&lt;/code&gt;: &lt;code&gt;19.26 tok/s&lt;/code&gt;&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;So for that model:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;&lt;code&gt;flash-attn on&lt;/code&gt; vs &lt;code&gt;auto&lt;/code&gt; barely changed anything&lt;/li&gt;\n&lt;li&gt;auto server parallel vs &lt;code&gt;parallel=1&lt;/code&gt; barely changed anything&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;Model links:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;Unsloth Qwen3-Coder-30B-A3B-Instruct-GGUF: &lt;a href=\"https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF\"&gt;https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF&lt;/a&gt;&lt;/li&gt;\n&lt;li&gt;Unsloth Qwen3.5-35B-A3B-GGUF: &lt;a href=\"https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF\"&gt;https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF&lt;/a&gt;&lt;/li&gt;\n&lt;li&gt;Jackrong Qwen3.5-27B Claude-4.6 Opus Reasoning Distilled GGUF: &lt;a href=\"https://huggingface.co/Jackrong/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-GGUF\"&gt;https://huggingface.co/Jackrong/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-GGUF&lt;/a&gt;&lt;/li&gt;\n&lt;li&gt;HauhauCS Qwen3.5-27B Uncensored Aggressive: &lt;a href=\"https://huggingface.co/HauhauCS/Qwen3.5-27B-Uncensored-HauhauCS-Aggressive\"&gt;https://huggingface.co/HauhauCS/Qwen3.5-27B-Uncensored-HauhauCS-Aggressive&lt;/a&gt;&lt;/li&gt;\n&lt;li&gt;Jackrong Qwen3.5-4B Claude-4.6 Opus Reasoning Distilled GGUF: &lt;a href=\"https://huggingface.co/Jackrong/Qwen3.5-4B-Claude-4.6-Opus-Reasoning-Distilled-GGUF\"&gt;https://huggingface.co/Jackrong/Qwen3.5-4B-Claude-4.6-Opus-Reasoning-Distilled-GGUF&lt;/a&gt;&lt;/li&gt;\n&lt;li&gt;LuffyTheFox Qwen3.5-9B Claude-4.6 Opus Uncensored Distilled GGUF: &lt;a href=\"https://huggingface.co/LuffyTheFox/Qwen3.5-9B-Claude-4.6-Opus-Uncensored-Distilled-GGUF\"&gt;https://huggingface.co/LuffyTheFox/Qwen3.5-9B-Claude-4.6-Opus-Uncensored-Distilled-GGUF&lt;/a&gt;&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;Bottom line:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;&lt;code&gt;Unsloth 30B coder&lt;/code&gt; is still the best practical recommendation for a &lt;code&gt;5060 Ti 16 GB&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;Unsloth 30B @ 96k&lt;/code&gt; is the upgrade path if you need more context&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;Unsloth 35B UD-Q2_K_XL&lt;/code&gt; is still the fast 35B coding option&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;Unsloth 35B Q4_K_M&lt;/code&gt; is useful to experiment with, but I would not daily-drive it on this hardware&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;Quick update since the original follow-up (22-Mar):&lt;/p&gt;\n\n&lt;p&gt;I reran &lt;code&gt;Qwen3.5-35B-A3B Q4_K_M&lt;/code&gt; apples-to-apples with the same quant and only changed the runtime/offload path.&lt;/p&gt;\n\n&lt;table&gt;&lt;thead&gt;\n&lt;tr&gt;\n&lt;th align=\"left\"&gt;Model&lt;/th&gt;\n&lt;th align=\"left\"&gt;Runtime&lt;/th&gt;\n&lt;th align=\"left\"&gt;Flags&lt;/th&gt;\n&lt;th align=\"left\"&gt;Score&lt;/th&gt;\n&lt;th align=\"left\"&gt;Prompt tok/s&lt;/th&gt;\n&lt;th align=\"left\"&gt;Decode tok/s&lt;/th&gt;\n&lt;/tr&gt;\n&lt;/thead&gt;&lt;tbody&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;Qwen3.5-35B-A3B &lt;code&gt;Q4_K_M&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;upstream &lt;code&gt;llama.cpp&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;isolated retest&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;16/22&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;113.26&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;26.24&lt;/code&gt;&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;Qwen3.5-35B-A3B &lt;code&gt;Q4_K_M&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;ik_llama.cpp&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;--n-cpu-moe 16&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;22/22&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;262.40&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;61.28&lt;/code&gt;&lt;/td&gt;\n&lt;/tr&gt;\n&lt;/tbody&gt;&lt;/table&gt;\n\n&lt;p&gt;For reference:&lt;/p&gt;\n\n&lt;table&gt;&lt;thead&gt;\n&lt;tr&gt;\n&lt;th align=\"left\"&gt;Model&lt;/th&gt;\n&lt;th align=\"left\"&gt;Runtime&lt;/th&gt;\n&lt;th align=\"left\"&gt;Flags&lt;/th&gt;\n&lt;th align=\"left\"&gt;Score&lt;/th&gt;\n&lt;th align=\"left\"&gt;Prompt tok/s&lt;/th&gt;\n&lt;th align=\"left\"&gt;Decode tok/s&lt;/th&gt;\n&lt;/tr&gt;\n&lt;/thead&gt;&lt;tbody&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;Qwen3.5-35B-A3B &lt;code&gt;Q5_K_M&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;upstream &lt;code&gt;llama.cpp&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;--cpu-moe&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;22/22&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;65.94&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;34.29&lt;/code&gt;&lt;/td&gt;\n&lt;/tr&gt;\n&lt;/tbody&gt;&lt;/table&gt;\n\n&lt;p&gt;Takeaway:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;the big jump was not &lt;code&gt;Q5&lt;/code&gt; vs &lt;code&gt;Q4&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;it was runtime/offload strategy&lt;/li&gt;\n&lt;li&gt;same &lt;code&gt;Q4_K_M&lt;/code&gt; went from &lt;code&gt;16/22&lt;/code&gt; to &lt;code&gt;22/22&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;and got much faster at the same time&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;Current best 35B setup on this machine:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;&lt;code&gt;Qwen3.5-35B-A3B Q4_K_M&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;ik_llama.cpp&lt;/code&gt;&lt;/li&gt;\n&lt;li&gt;&lt;code&gt;--n-cpu-moe 16&lt;/code&gt;&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;Updated bottom line:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;Qwen3.5-35B-A3B Q4_K_M on ik_llama.cpp --n-cpu-moe 16 is now the best practical recommendation on this 5060 Ti 16GB for the harder coding benchmark&lt;/li&gt;\n&lt;li&gt;Unsloth 30B coder is no longer the top recommendation on this test set&lt;/li&gt;\n&lt;li&gt;Unsloth 30B @ 96k can still make sense if your main need is longer context, but it is no longer the best overall coding pick here&lt;/li&gt;\n&lt;li&gt;Unsloth 35B UD-Q2_K_XL is no longer the most interesting fast 35B option&lt;/li&gt;\n&lt;li&gt;Unsloth 35B Q4_K_M is no longer just an experiment - with the right runtime/offload path, it is now the strongest 35B setup you\u2019ve tested locally&lt;/li&gt;\n&lt;/ul&gt;\n&lt;/div&gt;&lt;!-- SC_ON --&gt;",
+      "likes": null,
+      "suggested_sort": null,
+      "banned_at_utc": null,
+      "url_overridden_by_dest": "https://i.redd.it/r07aacodx7qg1.png",
+      "view_count": null,
+      "archived": false,
+      "no_follow": false,
+      "is_crosspostable": false,
+      "pinned": false,
+      "over_18": false,
+      "preview": {
+        "images": [
+          {
+            "source": {
+              "url": "https://preview.redd.it/r07aacodx7qg1.png?auto=webp&amp;s=4d044d332ee4d95cc956b9f83fccf90eb3ea96a7",
+              "width": 1400,
+              "height": 1990
+            },
+            "resolutions": [
+              {
+                "url": "https://preview.redd.it/r07aacodx7qg1.png?width=108&amp;crop=smart&amp;auto=webp&amp;s=5173cbc9447f018acb3fd5962bd9f144c74f2e35",
+                "width": 108,
+                "height": 153
+              },
+              {
+                "url": "https://preview.redd.it/r07aacodx7qg1.png?width=216&amp;crop=smart&amp;auto=webp&amp;s=3c351286c5cc67b5c271dd383ddd5b905a4485e1",
+                "width": 216,
+                "height": 307
+              },
+              {
+                "url": "https://preview.redd.it/r07aacodx7qg1.png?width=320&amp;crop=smart&amp;auto=webp&amp;s=5d8d580312c192f9793d422085d4dfadee7601fc",
+                "width": 320,
+                "height": 454
+              },
+              {
+                "url": "https://preview.redd.it/r07aacodx7qg1.png?width=640&amp;crop=smart&amp;auto=webp&amp;s=a185ec016cab700ded97580a1274c2b5b7ab82dc",
+                "width": 640,
+                "height": 909
+              },
+              {
+                "url": "https://preview.redd.it/r07aacodx7qg1.png?width=960&amp;crop=smart&amp;auto=webp&amp;s=c429ee58804c142f7652c328bd0128a4adf1bddf",
+                "width": 960,
+                "height": 1364
+              },
+              {
+                "url": "https://preview.redd.it/r07aacodx7qg1.png?width=1080&amp;crop=smart&amp;auto=webp&amp;s=afe61c343297d61ace2bdf369ce27fe6458d066c",
+                "width": 1080,
+                "height": 1535
+              }
+            ],
+            "variants": {},
+            "id": "r07aacodx7qg1"
+          }
+        ],
+        "enabled": true
+      },
+      "all_awardings": [],
+      "awarders": [],
+      "media_only": false,
+      "link_flair_template_id": "ab9120c4-bf8e-11ed-ae5e-2eb8b7c7e10b",
+      "can_gild": false,
+      "spoiler": false,
+      "locked": false,
+      "author_flair_text": null,
+      "treatment_tags": [],
+      "visited": false,
+      "removed_by": null,
+      "mod_note": null,
+      "distinguished": null,
+      "subreddit_id": "t5_81eyvm",
+      "author_is_blocked": false,
+      "mod_reason_by": null,
+      "num_reports": null,
+      "removal_reason": null,
+      "link_flair_background_color": "#ccac2b",
+      "id": "1ryze51",
+      "is_robot_indexable": true,
+      "report_reasons": null,
+      "author": "Imaginary-Anywhere23",
+      "discussion_type": null,
+      "num_comments": 28,
+      "send_replies": true,
+      "contest_mode": false,
+      "mod_reports": [],
+      "author_patreon_flair": false,
+      "author_flair_text_color": null,
+      "permalink": "/r/LocalLLaMA/comments/1ryze51/rtx_5060_ti_16gb_local_llm_findings_30b_still/",
+      "stickied": false,
+      "url": "https://i.redd.it/r07aacodx7qg1.png",
+      "subreddit_subscribers": 742102,
+      "created_utc": 1774020603.0,
+      "num_crossposts": 0,
+      "media": null,
+      "is_video": false
+    }
+  },
+  {
+    "kind": "t3",
+    "data": {
+      "approved_at_utc": null,
+      "subreddit": "LocalLLaMA",
+      "selftext": "[https://huggingface.co/Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B)",
+      "author_fullname": "t2_d0yded0yo",
+      "saved": false,
+      "mod_reason_title": null,
+      "gilded": 0,
+      "clicked": false,
+      "title": "Qwen 3.6 27B is out",
+      "link_flair_richtext": [
+        {
+          "e": "text",
+          "t": "New Model"
+        }
+      ],
+      "subreddit_name_prefixed": "r/LocalLLaMA",
+      "hidden": false,
+      "pwls": 6,
+      "link_flair_css_class": "",
+      "downs": 0,
+      "thumbnail_height": null,
+      "top_awarded_type": null,
+      "hide_score": false,
+      "name": "t3_1ssl1xh",
+      "quarantine": false,
+      "link_flair_text_color": "light",
+      "upvote_ratio": 0.97,
+      "author_flair_background_color": null,
+      "subreddit_type": "public",
+      "ups": 1724,
+      "total_awards_received": 0,
+      "media_embed": {},
+      "thumbnail_width": null,
+      "author_flair_template_id": null,
+      "is_original_content": false,
+      "user_reports": [],
+      "secure_media": null,
+      "is_reddit_media_domain": false,
+      "is_meta": false,
+      "category": null,
+      "secure_media_embed": {},
+      "link_flair_text": "New Model",
+      "can_mod_post": false,
+      "score": 1724,
+      "approved_by": null,
+      "is_created_from_ads_ui": false,
+      "author_premium": false,
+      "thumbnail": "self",
+      "edited": false,
+      "author_flair_css_class": null,
+      "author_flair_richtext": [],
+      "gildings": {},
+      "post_hint": "self",
+      "content_categories": null,
+      "is_self": true,
+      "mod_note": null,
+      "created": 1776863395.0,
+      "link_flair_type": "richtext",
+      "wls": 6,
+      "removed_by_category": null,
+      "banned_by": null,
+      "author_flair_type": "text",
+      "domain": "self.LocalLLaMA",
+      "allow_live_comments": false,
+      "selftext_html": "&lt;!-- SC_OFF --&gt;&lt;div class=\"md\"&gt;&lt;p&gt;&lt;a href=\"https://huggingface.co/Qwen/Qwen3.6-27B\"&gt;https://huggingface.co/Qwen/Qwen3.6-27B&lt;/a&gt;&lt;/p&gt;\n&lt;/div&gt;&lt;!-- SC_ON --&gt;",
+      "likes": null,
+      "suggested_sort": null,
+      "banned_at_utc": null,
+      "view_count": null,
+      "archived": false,
+      "no_follow": false,
+      "is_crosspostable": false,
+      "pinned": false,
+      "over_18": false,
+      "preview": {
+        "images": [
+          {
+            "source": {
+              "url": "https://external-preview.redd.it/MyX71Q2A7AbTTz7h9qkTFOSg5tayKBxIJ5DO0UZOtr4.png?auto=webp&amp;s=a6f4b540cf75aa23764f87f31810af099f2278e2",
+              "width": 1200,
+              "height": 648
+            },
+            "resolutions": [
+              {
+                "url": "https://external-preview.redd.it/MyX71Q2A7AbTTz7h9qkTFOSg5tayKBxIJ5DO0UZOtr4.png?width=108&amp;crop=smart&amp;auto=webp&amp;s=93da123d5def14ef10be45516cc689ccdeb8ec17",
+                "width": 108,
+                "height": 58
+              },
+              {
+                "url": "https://external-preview.redd.it/MyX71Q2A7AbTTz7h9qkTFOSg5tayKBxIJ5DO0UZOtr4.png?width=216&amp;crop=smart&amp;auto=webp&amp;s=c036692ba8c4294fc1065c42bc729deef33cb5f3",
+                "width": 216,
+                "height": 116
+              },
+              {
+                "url": "https://external-preview.redd.it/MyX71Q2A7AbTTz7h9qkTFOSg5tayKBxIJ5DO0UZOtr4.png?width=320&amp;crop=smart&amp;auto=webp&amp;s=380dd0a9bbee171115d12bb4561ebc8b1550ded8",
+                "width": 320,
+                "height": 172
+              },
+              {
+                "url": "https://external-preview.redd.it/MyX71Q2A7AbTTz7h9qkTFOSg5tayKBxIJ5DO0UZOtr4.png?width=640&amp;crop=smart&amp;auto=webp&amp;s=ba02835f3eefb01a4c4a5b00bde87f79cae7fa4d",
+                "width": 640,
+                "height": 345
+              },
+              {
+                "url": "https://external-preview.redd.it/MyX71Q2A7AbTTz7h9qkTFOSg5tayKBxIJ5DO0UZOtr4.png?width=960&amp;crop=smart&amp;auto=webp&amp;s=d13b367aa53d62cee471cd385e308398a58e10c1",
+                "width": 960,
+                "height": 518
+              },
+              {
+                "url": "https://external-preview.redd.it/MyX71Q2A7AbTTz7h9qkTFOSg5tayKBxIJ5DO0UZOtr4.png?width=1080&amp;crop=smart&amp;auto=webp&amp;s=f70ef7a5d79963bf6678ec9492f746520b5e9989",
+                "width": 1080,
+                "height": 583
+              }
+            ],
+            "variants": {},
+            "id": "MyX71Q2A7AbTTz7h9qkTFOSg5tayKBxIJ5DO0UZOtr4"
+          }
+        ],
+        "enabled": false
+      },
+      "all_awardings": [],
+      "awarders": [],
+      "media_only": false,
+      "link_flair_template_id": "ced98442-f5d3-11ed-b657-66d3b15490c6",
+      "can_gild": false,
+      "spoiler": false,
+      "locked": false,
+      "author_flair_text": null,
+      "treatment_tags": [],
+      "visited": false,
+      "removed_by": null,
+      "num_reports": null,
+      "distinguished": null,
+      "subreddit_id": "t5_81eyvm",
+      "author_is_blocked": false,
+      "mod_reason_by": null,
+      "removal_reason": null,
+      "link_flair_background_color": "#ffb000",
+      "id": "1ssl1xh",
+      "is_robot_indexable": true,
+      "report_reasons": null,
+      "author": "NoConcert8847",
+      "discussion_type": null,
+      "num_comments": 603,
+      "send_replies": true,
+      "contest_mode": false,
+      "mod_reports": [],
+      "author_patreon_flair": false,
+      "author_flair_text_color": null,
+      "permalink": "/r/LocalLLaMA/comments/1ssl1xh/qwen_36_27b_is_out/",
+      "stickied": false,
+      "url": "https://www.reddit.com/r/LocalLLaMA/comments/1ssl1xh/qwen_36_27b_is_out/",
+      "subreddit_subscribers": 742102,
+      "created_utc": 1776863395.0,
+      "num_crossposts": 3,
+      "media": null,
+      "is_video": false
+    }
+  },
+  {
+    "kind": "t3",
+    "data": {
+      "approved_at_utc": null,
+      "subreddit": "LocalLLaMA",
+      "selftext": "&gt;2026-05-14: **Major chat template update** Thanks to many users who tested the template in many different conditions, in addition to my own manual tests and test suite, I believe the template has now reached a high level of stability, greatly improving the experience with the Qwen models, while preserving universal compatibility. You do not need to re-download the GGUF files (I have not updated them yet), but you should **download the update chat template only from the** [**HF repo**](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates)**, and manually specify it.**\n\n&gt;*2026-05-07 edit: I have updated the hardware based recommendations with more focus on quality. I do not recommend q4\\_0 KV cache anymore beyond 64k context. After multiple rounds of testing with the different size quants, it appears* ***3 is the optimal number for draft speculative decoding.*** *The fastest and best quality quant is q8\\_0-mtp. F16, which I have also uploaded is actually better but ultra slow (6x slower than q8\\_0). Many keep saying 8bit is virtually lossless compared to 16bit, and 6bit almost as good as 8bit, but this is simply not true: time and time again I have noticed huge differences in quality and correctness between 8bit and 16bit versions of various models.*\n\nThe recent PR to llama.cpp bring MTP support to Qwen 3.6 27B. This uses the built-in tensor layers for speculative decoding. None of the existing GGUF have it, as they need to be converted with this PR.\n\nI have tested it locally on my mac M2 Max 96GB, and the results are amazing: 2.5x speed increase, bringing it to 28 tok/s!\n\nI have converted the most useful quants and uploaded them to HF. Even if you are using apple silicon, you should use those instead of MLX. You can download them here:\n\n[https://huggingface.co/froggeric/Qwen3.6-27B-MTP-GGUF](https://huggingface.co/froggeric/Qwen3.6-27B-MTP-GGUF)\n\nThis also includes 7 fixes I made to the original jinja chat template, due to vLLM specificity which broke in other tools:\n\n[https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates)\n\nFor now, you will need to compile your own version of llama.cpp to use them. It is fairly simple to do:\n\n    git clone --depth 1 https://github.com/ggml-org/llama.cpp.git\n    cd llama.cpp\n    git fetch origin pull/22673/head:mtp-pr &amp;&amp; git checkout mtp-pr\n    \n    cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release\n    cmake --build build --target llama-cli llama-server\n\nThen to start serving with the API endpoint, use a command similar to:\n\n    llama-server -m Qwen3.6-27B-Q5_K_M-mtp.gguf \\\n      --spec-type mtp --spec-draft-n-max 3 \\\n      --cache-type-k q8_0 --cache-type-v q8_0 \\\n      -np 1 -c 262144 --temp 0.7 --top-k 20 -ngl 99 --port 8081\n\n&gt;**Vision currently crashes llama.cpp when used alongside MTP.** Reported 2026-05-06 in the current PR.\n\nThat's it. Three optimizations in one command:\n\n|Flag|What it does|Impact|\n|:-|:-|:-|\n|`--spec-type mtp --spec-draft-n-max 3`|Multi-Token Prediction (built into the model)|**2.5x faster** generation|\n|`--cache-type-k q8_0 --cache-type-v q8_0`|8-bit KV cache (instead of 16-bit)|**Half the KV memory**, negligible quality loss|\n|`-c 262144`|262K context window|Full native context on **48 GB Mac** with q8\\_0 KV|\n\nAdjust `-m`, `-c`, and `--cache-type-k/v` for your hardware, according to the tables below.\n\nHere are my recommendations based on your hardware:\n\n# Apple Silicon\n\nQwen3.6-27B is a hybrid model \u2014 only **16 of 65 layers** use KV cache (verified). The other 48 are linear attention (fixed 898 MiB recurrent state). KV memory is **\\~4\u00d7 less** than a standard dense model. Runtimes that don't handle this (e.g. vllm) allocate KV for all 65 layers and show much higher memory usage.\n\nNumbers below are total memory used (model + KV cache + 0.9 GB recurrent state). Must leave **\u2265 8 GB for macOS** (16 GB Macs excepted).\n\n|RAM|Quant|KV cache|Max context|Total used|Vision|\n|:-|:-|:-|:-|:-|:-|\n|16 GB|`IQ2_M`|`q8_0`|**42K**|**12.0 GB**|\u2717|\n|24 GB|`IQ3_M`||**46K**|**16.0 GB**|\u2717|\n|24 GB|`IQ3_M`|`q8_0`|91K|16.0 GB|\u2717|\n|32 GB|`Q5_K_M`||**74K**|**24.0 GB**|\u2717|\n|32 GB|`Q5_K_M`|`q8_0`|147K|24.0 GB|\u2717|\n|32 GB|`Q4_K_M`||99K|24.0 GB|\u2713|\n|48 GB|`Q6_K`||**262K**|**39.7 GB**|\u2713|\n|48 GB|`Q8_0`||173K|40.0 GB|\u2713|\n|48 GB|`Q8_0`|`q8_0`|262K|37.3 GB|\u2713|\n|64 GB|`Q8_0`||**262K**|**45.8 GB**|\u2713|\n|96 GB|`Q8_0`||**262K**|**45.8 GB**|\u2713|\n\n# NVIDIA GPU\n\nSame model memory as Apple Silicon, plus \\~1 GB CUDA overhead.\n\n|VRAM|Quant|KV cache|Max context|Total VRAM used|Vision|\n|:-|:-|:-|:-|:-|:-|\n|12 GB|`IQ2_M`|`q8_0`|**11K**|**12.0 GB**|\u2717|\n|16 GB|`IQ3_M`||**30K**|**16.0 GB**|\u2717|\n|16 GB|`IQ3_M`|`q8_0`|60K|16.0 GB|\u2717|\n|24 GB|`Q4_K_M`||**83K**|**24.0 GB**|\u2713|\n|24 GB|`Q4_K_M`|`q8_0`|167K|24.0 GB|\u2713|\n|24 GB|`Q5_K_M`||58K|24.0 GB|\u2717|\n|48 GB|`Q6_K`||**262K**|**40.7 GB**|\u2713|\n|48 GB|`Q8_0`||262K|46.8 GB|\u2713|\n|80 GB|`Q8_0`||**262K**|**46.8 GB**|\u2713|\n\n&gt;**16 GB Mac:** `IQ2_M`/q8\\_0 \u2014 42K text-only. No vision.  \n&gt;  \n&gt;**24 GB Mac:** `IQ3_M` \u2014 46K (f16 KV) or 91K (q8\\_0). Vision at 32\u201365K.  \n&gt;  \n&gt;**32 GB Mac:** `Q5_K_M` \u2014 74K text-only (f16 KV), 147K (q8\\_0). `Q4_K_M` for vision at 99K.  \n&gt;  \n&gt;**48 GB Mac:** `Q6_K`/f16 KV \u2014 262K with vision. `Q8_0`/q8\\_0 KV for 262K at higher model quality.  \n&gt;  \n&gt;**64 GB+ Mac:** `Q8_0`/f16 KV \u2014 262K with vision. Maximum quality at practical speed.  \n&gt;  \n&gt;**12 GB GPU:** `IQ2_M`/q8\\_0 \u2014 11K. Very limited, no vision.  \n&gt;  \n&gt;**16 GB GPU:** `IQ3_M` \u2014 30K (f16 KV) or 60K (q8\\_0). No vision.  \n&gt;  \n&gt;**24 GB GPU:** `Q4_K_M` \u2014 83K with vision (f16 KV). `Q5_K_M` \u2014 58K text-only (f16 KV), 116K (q8\\_0).  \n&gt;  \n&gt;**48 GB+ GPU:** `Q6_K`/f16 KV \u2014 262K with vision. `Q8_0` for max quality.\n\nLeave KV cache at f16 (blank column) for best quality. Use `q8_0` KV only when f16 doesn't give enough context. `q4_0` KV should not exceed 64K context.\n\nVision adds \\~0.9 GB for mmproj. macOS needs **\u2265 8 GB** for itself (16 GB Macs excepted \u2014 use \\~4 GB). You can increase available memory by raising the wired memory limit, e.g. for a 96 GB Mac: `sudo sysctl iogpu.wired_limit_mb=90112` (88 GB). NVIDIA reserves \\~1 GB for CUDA.",
+      "author_fullname": "t2_k1r7a0eo0",
+      "saved": false,
+      "mod_reason_title": null,
+      "gilded": 0,
+      "clicked": false,
+      "title": "2.5x faster inference with Qwen 3.6 27B using MTP - Finally a viable option for local agentic coding - 262k context on 48GB - Fixed chat template - Drop-in OpenAI and Anthropic API endpoints",
+      "link_flair_richtext": [
+        {
+          "e": "text",
+          "t": "Resources"
+        }
+      ],
+      "subreddit_name_prefixed": "r/LocalLLaMA",
+      "hidden": false,
+      "pwls": 6,
+      "link_flair_css_class": "",
+      "downs": 0,
+      "thumbnail_height": null,
+      "top_awarded_type": null,
+      "hide_score": false,
+      "name": "t3_1t57xuu",
+      "quarantine": false,
+      "link_flair_text_color": "light",
+      "upvote_ratio": 0.97,
+      "author_flair_background_color": "",
+      "subreddit_type": "public",
+      "ups": 1235,
+      "total_awards_received": 0,
+      "media_embed": {},
+      "thumbnail_width": null,
+      "author_flair_template_id": null,
+      "is_original_content": false,
+      "user_reports": [],
+      "secure_media": null,
+      "is_reddit_media_domain": false,
+      "is_meta": false,
+      "category": null,
+      "secure_media_embed": {},
+      "link_flair_text": "Resources",
+      "can_mod_post": false,
+      "score": 1235,
+      "approved_by": null,
+      "is_created_from_ads_ui": false,
+      "author_premium": false,
+      "thumbnail": "self",
+      "edited": 1778778289.0,
+      "author_flair_css_class": null,
+      "author_flair_richtext": [
+        {
+          "a": ":Discord:",
+          "e": "emoji",
+          "u": "https://emoji.redditmedia.com/08m5x9chttjf1_t5_81eyvm/Discord"
+        }
+      ],
+      "gildings": {},
+      "post_hint": "self",
+      "content_categories": null,
+      "is_self": true,
+      "mod_note": null,
+      "created": 1778060142.0,
+      "link_flair_type": "richtext",
+      "wls": 6,
+      "removed_by_category": null,
+      "banned_by": null,
+      "author_flair_type": "richtext",
+      "domain": "self.LocalLLaMA",
+      "allow_live_comments": false,
+      "selftext_html": "&lt;!-- SC_OFF --&gt;&lt;div class=\"md\"&gt;&lt;blockquote&gt;\n&lt;p&gt;2026-05-14: &lt;strong&gt;Major chat template update&lt;/strong&gt; Thanks to many users who tested the template in many different conditions, in addition to my own manual tests and test suite, I believe the template has now reached a high level of stability, greatly improving the experience with the Qwen models, while preserving universal compatibility. You do not need to re-download the GGUF files (I have not updated them yet), but you should &lt;strong&gt;download the update chat template only from the&lt;/strong&gt; &lt;a href=\"https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates\"&gt;&lt;strong&gt;HF repo&lt;/strong&gt;&lt;/a&gt;&lt;strong&gt;, and manually specify it.&lt;/strong&gt;&lt;/p&gt;\n\n&lt;p&gt;&lt;em&gt;2026-05-07 edit: I have updated the hardware based recommendations with more focus on quality. I do not recommend q4_0 KV cache anymore beyond 64k context. After multiple rounds of testing with the different size quants, it appears&lt;/em&gt; &lt;strong&gt;&lt;em&gt;3 is the optimal number for draft speculative decoding.&lt;/em&gt;&lt;/strong&gt; &lt;em&gt;The fastest and best quality quant is q8_0-mtp. F16, which I have also uploaded is actually better but ultra slow (6x slower than q8_0). Many keep saying 8bit is virtually lossless compared to 16bit, and 6bit almost as good as 8bit, but this is simply not true: time and time again I have noticed huge differences in quality and correctness between 8bit and 16bit versions of various models.&lt;/em&gt;&lt;/p&gt;\n&lt;/blockquote&gt;\n\n&lt;p&gt;The recent PR to llama.cpp bring MTP support to Qwen 3.6 27B. This uses the built-in tensor layers for speculative decoding. None of the existing GGUF have it, as they need to be converted with this PR.&lt;/p&gt;\n\n&lt;p&gt;I have tested it locally on my mac M2 Max 96GB, and the results are amazing: 2.5x speed increase, bringing it to 28 tok/s!&lt;/p&gt;\n\n&lt;p&gt;I have converted the most useful quants and uploaded them to HF. Even if you are using apple silicon, you should use those instead of MLX. You can download them here:&lt;/p&gt;\n\n&lt;p&gt;&lt;a href=\"https://huggingface.co/froggeric/Qwen3.6-27B-MTP-GGUF\"&gt;https://huggingface.co/froggeric/Qwen3.6-27B-MTP-GGUF&lt;/a&gt;&lt;/p&gt;\n\n&lt;p&gt;This also includes 7 fixes I made to the original jinja chat template, due to vLLM specificity which broke in other tools:&lt;/p&gt;\n\n&lt;p&gt;&lt;a href=\"https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates\"&gt;https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates&lt;/a&gt;&lt;/p&gt;\n\n&lt;p&gt;For now, you will need to compile your own version of llama.cpp to use them. It is fairly simple to do:&lt;/p&gt;\n\n&lt;pre&gt;&lt;code&gt;git clone --depth 1 https://github.com/ggml-org/llama.cpp.git\ncd llama.cpp\ngit fetch origin pull/22673/head:mtp-pr &amp;amp;&amp;amp; git checkout mtp-pr\n\ncmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release\ncmake --build build --target llama-cli llama-server\n&lt;/code&gt;&lt;/pre&gt;\n\n&lt;p&gt;Then to start serving with the API endpoint, use a command similar to:&lt;/p&gt;\n\n&lt;pre&gt;&lt;code&gt;llama-server -m Qwen3.6-27B-Q5_K_M-mtp.gguf \\\n  --spec-type mtp --spec-draft-n-max 3 \\\n  --cache-type-k q8_0 --cache-type-v q8_0 \\\n  -np 1 -c 262144 --temp 0.7 --top-k 20 -ngl 99 --port 8081\n&lt;/code&gt;&lt;/pre&gt;\n\n&lt;blockquote&gt;\n&lt;p&gt;&lt;strong&gt;Vision currently crashes llama.cpp when used alongside MTP.&lt;/strong&gt; Reported 2026-05-06 in the current PR.&lt;/p&gt;\n&lt;/blockquote&gt;\n\n&lt;p&gt;That&amp;#39;s it. Three optimizations in one command:&lt;/p&gt;\n\n&lt;table&gt;&lt;thead&gt;\n&lt;tr&gt;\n&lt;th align=\"left\"&gt;Flag&lt;/th&gt;\n&lt;th align=\"left\"&gt;What it does&lt;/th&gt;\n&lt;th align=\"left\"&gt;Impact&lt;/th&gt;\n&lt;/tr&gt;\n&lt;/thead&gt;&lt;tbody&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;--spec-type mtp --spec-draft-n-max 3&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;Multi-Token Prediction (built into the model)&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;strong&gt;2.5x faster&lt;/strong&gt; generation&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;--cache-type-k q8_0 --cache-type-v q8_0&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;8-bit KV cache (instead of 16-bit)&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;strong&gt;Half the KV memory&lt;/strong&gt;, negligible quality loss&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;-c 262144&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;262K context window&lt;/td&gt;\n&lt;td align=\"left\"&gt;Full native context on &lt;strong&gt;48 GB Mac&lt;/strong&gt; with q8_0 KV&lt;/td&gt;\n&lt;/tr&gt;\n&lt;/tbody&gt;&lt;/table&gt;\n\n&lt;p&gt;Adjust &lt;code&gt;-m&lt;/code&gt;, &lt;code&gt;-c&lt;/code&gt;, and &lt;code&gt;--cache-type-k/v&lt;/code&gt; for your hardware, according to the tables below.&lt;/p&gt;\n\n&lt;p&gt;Here are my recommendations based on your hardware:&lt;/p&gt;\n\n&lt;h1&gt;Apple Silicon&lt;/h1&gt;\n\n&lt;p&gt;Qwen3.6-27B is a hybrid model \u2014 only &lt;strong&gt;16 of 65 layers&lt;/strong&gt; use KV cache (verified). The other 48 are linear attention (fixed 898 MiB recurrent state). KV memory is &lt;strong&gt;~4\u00d7 less&lt;/strong&gt; than a standard dense model. Runtimes that don&amp;#39;t handle this (e.g. vllm) allocate KV for all 65 layers and show much higher memory usage.&lt;/p&gt;\n\n&lt;p&gt;Numbers below are total memory used (model + KV cache + 0.9 GB recurrent state). Must leave &lt;strong&gt;\u2265 8 GB for macOS&lt;/strong&gt; (16 GB Macs excepted).&lt;/p&gt;\n\n&lt;table&gt;&lt;thead&gt;\n&lt;tr&gt;\n&lt;th align=\"left\"&gt;RAM&lt;/th&gt;\n&lt;th align=\"left\"&gt;Quant&lt;/th&gt;\n&lt;th align=\"left\"&gt;KV cache&lt;/th&gt;\n&lt;th align=\"left\"&gt;Max context&lt;/th&gt;\n&lt;th align=\"left\"&gt;Total used&lt;/th&gt;\n&lt;th align=\"left\"&gt;Vision&lt;/th&gt;\n&lt;/tr&gt;\n&lt;/thead&gt;&lt;tbody&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;16 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;IQ2_M&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;q8_0&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;strong&gt;42K&lt;/strong&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;strong&gt;12.0 GB&lt;/strong&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;\u2717&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;24 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;IQ3_M&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;strong&gt;46K&lt;/strong&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;strong&gt;16.0 GB&lt;/strong&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;\u2717&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;24 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;IQ3_M&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;q8_0&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;91K&lt;/td&gt;\n&lt;td align=\"left\"&gt;16.0 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;\u2717&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;32 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;Q5_K_M&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;strong&gt;74K&lt;/strong&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;strong&gt;24.0 GB&lt;/strong&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;\u2717&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;32 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;Q5_K_M&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;q8_0&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;147K&lt;/td&gt;\n&lt;td align=\"left\"&gt;24.0 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;\u2717&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;32 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;Q4_K_M&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;99K&lt;/td&gt;\n&lt;td align=\"left\"&gt;24.0 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;\u2713&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;48 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;Q6_K&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;strong&gt;262K&lt;/strong&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;strong&gt;39.7 GB&lt;/strong&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;\u2713&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;48 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;Q8_0&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;173K&lt;/td&gt;\n&lt;td align=\"left\"&gt;40.0 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;\u2713&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;48 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;Q8_0&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;q8_0&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;262K&lt;/td&gt;\n&lt;td align=\"left\"&gt;37.3 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;\u2713&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;64 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;Q8_0&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;strong&gt;262K&lt;/strong&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;strong&gt;45.8 GB&lt;/strong&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;\u2713&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;96 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;Q8_0&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;strong&gt;262K&lt;/strong&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;strong&gt;45.8 GB&lt;/strong&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;\u2713&lt;/td&gt;\n&lt;/tr&gt;\n&lt;/tbody&gt;&lt;/table&gt;\n\n&lt;h1&gt;NVIDIA GPU&lt;/h1&gt;\n\n&lt;p&gt;Same model memory as Apple Silicon, plus ~1 GB CUDA overhead.&lt;/p&gt;\n\n&lt;table&gt;&lt;thead&gt;\n&lt;tr&gt;\n&lt;th align=\"left\"&gt;VRAM&lt;/th&gt;\n&lt;th align=\"left\"&gt;Quant&lt;/th&gt;\n&lt;th align=\"left\"&gt;KV cache&lt;/th&gt;\n&lt;th align=\"left\"&gt;Max context&lt;/th&gt;\n&lt;th align=\"left\"&gt;Total VRAM used&lt;/th&gt;\n&lt;th align=\"left\"&gt;Vision&lt;/th&gt;\n&lt;/tr&gt;\n&lt;/thead&gt;&lt;tbody&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;12 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;IQ2_M&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;q8_0&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;strong&gt;11K&lt;/strong&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;strong&gt;12.0 GB&lt;/strong&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;\u2717&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;16 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;IQ3_M&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;strong&gt;30K&lt;/strong&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;strong&gt;16.0 GB&lt;/strong&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;\u2717&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;16 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;IQ3_M&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;q8_0&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;60K&lt;/td&gt;\n&lt;td align=\"left\"&gt;16.0 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;\u2717&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;24 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;Q4_K_M&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;strong&gt;83K&lt;/strong&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;strong&gt;24.0 GB&lt;/strong&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;\u2713&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;24 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;Q4_K_M&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;q8_0&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;167K&lt;/td&gt;\n&lt;td align=\"left\"&gt;24.0 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;\u2713&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;24 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;Q5_K_M&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;58K&lt;/td&gt;\n&lt;td align=\"left\"&gt;24.0 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;\u2717&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;48 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;Q6_K&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;strong&gt;262K&lt;/strong&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;strong&gt;40.7 GB&lt;/strong&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;\u2713&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;48 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;Q8_0&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;262K&lt;/td&gt;\n&lt;td align=\"left\"&gt;46.8 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;\u2713&lt;/td&gt;\n&lt;/tr&gt;\n&lt;tr&gt;\n&lt;td align=\"left\"&gt;80 GB&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;code&gt;Q8_0&lt;/code&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;strong&gt;262K&lt;/strong&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;&lt;strong&gt;46.8 GB&lt;/strong&gt;&lt;/td&gt;\n&lt;td align=\"left\"&gt;\u2713&lt;/td&gt;\n&lt;/tr&gt;\n&lt;/tbody&gt;&lt;/table&gt;\n\n&lt;blockquote&gt;\n&lt;p&gt;&lt;strong&gt;16 GB Mac:&lt;/strong&gt; &lt;code&gt;IQ2_M&lt;/code&gt;/q8_0 \u2014 42K text-only. No vision.  &lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;24 GB Mac:&lt;/strong&gt; &lt;code&gt;IQ3_M&lt;/code&gt; \u2014 46K (f16 KV) or 91K (q8_0). Vision at 32\u201365K.  &lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;32 GB Mac:&lt;/strong&gt; &lt;code&gt;Q5_K_M&lt;/code&gt; \u2014 74K text-only (f16 KV), 147K (q8_0). &lt;code&gt;Q4_K_M&lt;/code&gt; for vision at 99K.  &lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;48 GB Mac:&lt;/strong&gt; &lt;code&gt;Q6_K&lt;/code&gt;/f16 KV \u2014 262K with vision. &lt;code&gt;Q8_0&lt;/code&gt;/q8_0 KV for 262K at higher model quality.  &lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;64 GB+ Mac:&lt;/strong&gt; &lt;code&gt;Q8_0&lt;/code&gt;/f16 KV \u2014 262K with vision. Maximum quality at practical speed.  &lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;12 GB GPU:&lt;/strong&gt; &lt;code&gt;IQ2_M&lt;/code&gt;/q8_0 \u2014 11K. Very limited, no vision.  &lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;16 GB GPU:&lt;/strong&gt; &lt;code&gt;IQ3_M&lt;/code&gt; \u2014 30K (f16 KV) or 60K (q8_0). No vision.  &lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;24 GB GPU:&lt;/strong&gt; &lt;code&gt;Q4_K_M&lt;/code&gt; \u2014 83K with vision (f16 KV). &lt;code&gt;Q5_K_M&lt;/code&gt; \u2014 58K text-only (f16 KV), 116K (q8_0).  &lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;48 GB+ GPU:&lt;/strong&gt; &lt;code&gt;Q6_K&lt;/code&gt;/f16 KV \u2014 262K with vision. &lt;code&gt;Q8_0&lt;/code&gt; for max quality.&lt;/p&gt;\n&lt;/blockquote&gt;\n\n&lt;p&gt;Leave KV cache at f16 (blank column) for best quality. Use &lt;code&gt;q8_0&lt;/code&gt; KV only when f16 doesn&amp;#39;t give enough context. &lt;code&gt;q4_0&lt;/code&gt; KV should not exceed 64K context.&lt;/p&gt;\n\n&lt;p&gt;Vision adds ~0.9 GB for mmproj. macOS needs &lt;strong&gt;\u2265 8 GB&lt;/strong&gt; for itself (16 GB Macs excepted \u2014 use ~4 GB). You can increase available memory by raising the wired memory limit, e.g. for a 96 GB Mac: &lt;code&gt;sudo sysctl iogpu.wired_limit_mb=90112&lt;/code&gt; (88 GB). NVIDIA reserves ~1 GB for CUDA.&lt;/p&gt;\n&lt;/div&gt;&lt;!-- SC_ON --&gt;",
+      "likes": null,
+      "suggested_sort": null,
+      "banned_at_utc": null,
+      "view_count": null,
+      "archived": false,
+      "no_follow": false,
+      "is_crosspostable": false,
+      "pinned": false,
+      "over_18": false,
+      "preview": {
+        "images": [
+          {
+            "source": {
+              "url": "https://external-preview.redd.it/IfPoaGWeClazSZy4SVwW3r5Xqf16NsqxPN-dpy_5fGM.png?auto=webp&amp;s=bbba39df6330bb4981f49f4e0bab3d6400f405e5",
+              "width": 1200,
+              "height": 648
+            },
+            "resolutions": [
+              {
+                "url": "https://external-preview.redd.it/IfPoaGWeClazSZy4SVwW3r5Xqf16NsqxPN-dpy_5fGM.png?width=108&amp;crop=smart&amp;auto=webp&amp;s=5d44cccd2a8d9e684ddfbd2adf2d69d8a3b6c1d2",
+                "width": 108,
+                "height": 58
+              },
+              {
+                "url": "https://external-preview.redd.it/IfPoaGWeClazSZy4SVwW3r5Xqf16NsqxPN-dpy_5fGM.png?width=216&amp;crop=smart&amp;auto=webp&amp;s=9a85cbc28f34d28762aaaf0156da1c37bdbeb091",
+                "width": 216,
+                "height": 116
+              },
+              {
+                "url": "https://external-preview.redd.it/IfPoaGWeClazSZy4SVwW3r5Xqf16NsqxPN-dpy_5fGM.png?width=320&amp;crop=smart&amp;auto=webp&amp;s=af16674cb15365776fe1fad321a18fc6f58b8e7c",
+                "width": 320,
+                "height": 172
+              },
+              {
+                "url": "https://external-preview.redd.it/IfPoaGWeClazSZy4SVwW3r5Xqf16NsqxPN-dpy_5fGM.png?width=640&amp;crop=smart&amp;auto=webp&amp;s=df8d0ad72aaef5350ab102440a91b326be8d9a45",
+                "width": 640,
+                "height": 345
+              },
+              {
+                "url": "https://external-preview.redd.it/IfPoaGWeClazSZy4SVwW3r5Xqf16NsqxPN-dpy_5fGM.png?width=960&amp;crop=smart&amp;auto=webp&amp;s=2cc18a39c4e743fad863ecf1178785975f81d403",
+                "width": 960,
+                "height": 518
+              },
+              {
+                "url": "https://external-preview.redd.it/IfPoaGWeClazSZy4SVwW3r5Xqf16NsqxPN-dpy_5fGM.png?width=1080&amp;crop=smart&amp;auto=webp&amp;s=2e9d75402f54d7077dc01502d9741a8b1fe104ae",
+                "width": 1080,
+                "height": 583
+              }
+            ],
+            "variants": {},
+            "id": "IfPoaGWeClazSZy4SVwW3r5Xqf16NsqxPN-dpy_5fGM"
+          }
+        ],
+        "enabled": false
+      },
+      "all_awardings": [],
+      "awarders": [],
+      "media_only": false,
+      "link_flair_template_id": "ab9120c4-bf8e-11ed-ae5e-2eb8b7c7e10b",
+      "can_gild": false,
+      "spoiler": false,
+      "locked": false,
+      "author_flair_text": ":Discord:",
+      "treatment_tags": [],
+      "visited": false,
+      "removed_by": null,
+      "num_reports": null,
+      "distinguished": null,
+      "subreddit_id": "t5_81eyvm",
+      "author_is_blocked": false,
+      "mod_reason_by": null,
+      "removal_reason": null,
+      "link_flair_background_color": "#ccac2b",
+      "id": "1t57xuu",
+      "is_robot_indexable": true,
+      "report_reasons": null,
+      "author": "ex-arman68",
+      "discussion_type": null,
+      "num_comments": 401,
+      "send_replies": true,
+      "contest_mode": false,
+      "mod_reports": [],
+      "author_patreon_flair": false,
+      "author_flair_text_color": "dark",
+      "permalink": "/r/LocalLLaMA/comments/1t57xuu/25x_faster_inference_with_qwen_36_27b_using_mtp/",
+      "stickied": false,
+      "url": "https://www.reddit.com/r/LocalLLaMA/comments/1t57xuu/25x_faster_inference_with_qwen_36_27b_using_mtp/",
+      "subreddit_subscribers": 742102,
+      "created_utc": 1778060142.0,
+      "num_crossposts": 3,
+      "media": null,
+      "is_video": false
+    }
+  },
+  {
+    "kind": "t3",
+    "data": {
+      "approved_at_utc": null,
+      "subreddit": "LocalLLaMA",
+      "selftext": "I have a 5090 Laptop from work, 24GB VRAM.\n\nI have been testing every model that comes out, and I can confidently say I\u2019ll be cancelling my cloud subscriptions.\n\nAll my tool call and data science benchmarks that prove a model is reliably good for my use case, passed.\n\nIt might not be the case for other professions, but for pyspark/python and data transformation debugging it\u2019s basically perfect.\n\nUsing llama.cpp, q4\\_k\\_m at q4\\_0, still looking at options for optimising.\n\nEdit - I chose to go with IQ4\\_XS at 200k q8\\_0, \n\nI have not used speculative decoding yet, will get there when I get there. \n\nSpecs: \n\nASUS ROG Strix SCAR 18 \n\nRTX 5090 24GB \n\n64GB DDR5 RAM ",
+      "author_fullname": "t2_7o6drp82",
+      "saved": false,
+      "mod_reason_title": null,
+      "gilded": 0,
+      "clicked": false,
+      "title": "Qwen 3.6 27B is a BEAST",
+      "link_flair_richtext": [
+        {
+          "e": "text",
+          "t": "New Model"
+        }
+      ],
+      "subreddit_name_prefixed": "r/LocalLLaMA",
+      "hidden": false,
+      "pwls": 6,
+      "link_flair_css_class": "",
+      "downs": 0,
+      "thumbnail_height": null,
+      "top_awarded_type": null,
+      "hide_score": false,
+      "name": "t3_1steip4",
+      "quarantine": false,
+      "link_flair_text_color": "light",
+      "upvote_ratio": 0.97,
+      "author_flair_background_color": null,
+      "subreddit_type": "public",
+      "ups": 645,
+      "total_awards_received": 0,
+      "media_embed": {},
+      "thumbnail_width": null,
+      "author_flair_template_id": null,
+      "is_original_content": false,
+      "user_reports": [],
+      "secure_media": null,
+      "is_reddit_media_domain": false,
+      "is_meta": false,
+      "category": null,
+      "secure_media_embed": {},
+      "link_flair_text": "New Model",
+      "can_mod_post": false,
+      "score": 645,
+      "approved_by": null,
+      "is_created_from_ads_ui": false,
+      "author_premium": false,
+      "thumbnail": "self",
+      "edited": 1776961990.0,
+      "author_flair_css_class": null,
+      "author_flair_richtext": [],
+      "gildings": {},
+      "content_categories": null,
+      "is_self": true,
+      "mod_note": null,
+      "created": 1776939048.0,
+      "link_flair_type": "richtext",
+      "wls": 6,
+      "removed_by_category": null,
+      "banned_by": null,
+      "author_flair_type": "text",
+      "domain": "self.LocalLLaMA",
+      "allow_live_comments": false,
+      "selftext_html": "&lt;!-- SC_OFF --&gt;&lt;div class=\"md\"&gt;&lt;p&gt;I have a 5090 Laptop from work, 24GB VRAM.&lt;/p&gt;\n\n&lt;p&gt;I have been testing every model that comes out, and I can confidently say I\u2019ll be cancelling my cloud subscriptions.&lt;/p&gt;\n\n&lt;p&gt;All my tool call and data science benchmarks that prove a model is reliably good for my use case, passed.&lt;/p&gt;\n\n&lt;p&gt;It might not be the case for other professions, but for pyspark/python and data transformation debugging it\u2019s basically perfect.&lt;/p&gt;\n\n&lt;p&gt;Using llama.cpp, q4_k_m at q4_0, still looking at options for optimising.&lt;/p&gt;\n\n&lt;p&gt;Edit - I chose to go with IQ4_XS at 200k q8_0, &lt;/p&gt;\n\n&lt;p&gt;I have not used speculative decoding yet, will get there when I get there. &lt;/p&gt;\n\n&lt;p&gt;Specs: &lt;/p&gt;\n\n&lt;p&gt;ASUS ROG Strix SCAR 18 &lt;/p&gt;\n\n&lt;p&gt;RTX 5090 24GB &lt;/p&gt;\n\n&lt;p&gt;64GB DDR5 RAM &lt;/p&gt;\n&lt;/div&gt;&lt;!-- SC_ON --&gt;",
+      "likes": null,
+      "suggested_sort": null,
+      "banned_at_utc": null,
+      "view_count": null,
+      "archived": false,
+      "no_follow": false,
+      "is_crosspostable": false,
+      "pinned": false,
+      "over_18": false,
+      "all_awardings": [],
+      "awarders": [],
+      "media_only": false,
+      "link_flair_template_id": "ced98442-f5d3-11ed-b657-66d3b15490c6",
+      "can_gild": false,
+      "spoiler": false,
+      "locked": false,
+      "author_flair_text": null,
+      "treatment_tags": [],
+      "visited": false,
+      "removed_by": null,
+      "num_reports": null,
+      "distinguished": null,
+      "subreddit_id": "t5_81eyvm",
+      "author_is_blocked": false,
+      "mod_reason_by": null,
+      "removal_reason": null,
+      "link_flair_background_color": "#ffb000",
+      "id": "1steip4",
+      "is_robot_indexable": true,
+      "report_reasons": null,
+      "author": "AverageFormal9076",
+      "discussion_type": null,
+      "num_comments": 334,
+      "send_replies": true,
+      "contest_mode": false,
+      "mod_reports": [],
+      "author_patreon_flair": false,
+      "author_flair_text_color": null,
+      "permalink": "/r/LocalLLaMA/comments/1steip4/qwen_36_27b_is_a_beast/",
+      "stickied": false,
+      "url": "https://www.reddit.com/r/LocalLLaMA/comments/1steip4/qwen_36_27b_is_a_beast/",
+      "subreddit_subscribers": 742102,
+      "created_utc": 1776939048.0,
+      "num_crossposts": 1,
+      "media": null,
+      "is_video": false
+    }
+  },
+  {
+    "kind": "t3",
+    "data": {
+      "approved_at_utc": null,
+      "subreddit": "LocalLLaMA",
+      "selftext": "Gemma just crushed Qwen in a local LLM gamedev contest!\n\nDevice: MacBook Pro M5 Max, 64GB RAM\n\nQwen 3.6 27B: 32 tokens/sec \u00b7 18m 04s \u00b7 33,946 tokens.  \nGemma 4 31B: 27 tokens/sec \u00b7 3m 51s \u00b7 6,209 tokens.\n\nSo what is more important: tokens per second, or the quality of the final answer?\n\nQwen made a very long response and showed more creativity and visual style. But Gemma gave a shorter, clearer, and more logical answer in much less time. In this one-shot Pac-Man gamedev contest, Gemma 4 31B was the clear winner. Its game logic was stronger: click reactions were smoother, and it handled interactions with elements like walls, ghosts, and particle effects better.\n\nOpen Source Local AI Models Server: [atomic.chat](http://atomic.chat)\n\nBasic Prompt:\n\nCreate a single standalone HTML file for a complete playable Pac-Man\u2013style neon arcade game.\n\nUse only HTML, CSS, JavaScript, and one full-page canvas. No external libraries or assets\u2014everything must be procedurally drawn and run immediately in the browser.\n\nGenerate a compact (\\~21\u00d721) symmetrical maze programmatically (no ASCII). It must be fully connected, playable, and use tile types (wall, path, pellet, power pellet, ghost spawn, Pac-Man spawn, fruit spawn). Ensure no unreachable pellets or invalid spawns.\n\nCanvas must fill the window. Center and scale the maze dynamically using available space (no fixed tile size). Reserve space for a HUD.\n\nGame states: title, playing, paused, life lost, level complete, game over. Include controls (keyboard + mobile). Title and game over screens must show instructions.\n\nPac-Man: smooth tile movement, queued turns, no diagonal movement, no clipping, wraps through side tunnels, resets after life loss.\n\nGhosts (4): simple pathfinding with distinct behaviors, spawn in a central house, exit with delays, move only on valid paths, never freeze.\n\nGameplay:\n\n* Pellets (+10), power pellets (+50), fruit (+500), ghost chain scoring (200\u21921600)\n* Power mode (\\~8s, min 3s): ghosts become edible and return to spawn when eaten\n* Combo multiplier for quick pellet collection\n* 3 lives, level progression increases difficulty\n* Store high score in localStorage\n\nExtras:\n\n* Fruit spawns near center temporarily\n* Visual polish: neon maze, glowing elements, animations, particles, screen effects\n* HUD: score, high score, lives, level, combo, power timer\n\nTechnical:\n\n* Use requestAnimationFrame with delta time\n* Keep performance stable (limit particles)\n* No bugs: avoid invalid movement, stuck entities, unreachable areas, or crashes\n\nFinal output: only the complete HTML code.",
+      "author_fullname": "t2_11akqo",
+      "saved": false,
+      "mod_reason_title": null,
+      "gilded": 0,
+      "clicked": false,
+      "title": "Qwen 3.6 27B vs Gemma 4 31B - making Packman game!",
+      "link_flair_richtext": [
+        {
+          "e": "text",
+          "t": "Generation"
+        }
+      ],
+      "subreddit_name_prefixed": "r/LocalLLaMA",
+      "hidden": false,
+      "pwls": 6,
+      "link_flair_css_class": "",
+      "downs": 0,
+      "thumbnail_height": 73,
+      "top_awarded_type": null,
+      "hide_score": false,
+      "name": "t3_1t0epei",
+      "quarantine": false,
+      "link_flair_text_color": "light",
+      "upvote_ratio": 0.95,
+      "author_flair_background_color": "",
+      "ups": 993,
+      "total_awards_received": 0,
+      "media_embed": {},
+      "thumbnail_width": 140,
+      "author_flair_template_id": null,
+      "is_original_content": false,
+      "user_reports": [],
+      "secure_media": {
+        "reddit_video": {
+          "bitrate_kbps": 1200,
+          "fallback_url": "https://v.redd.it/s0czzkm85fyg1/CMAF_480.mp4?source=fallback",
+          "has_audio": true,
+          "height": 448,
+          "width": 854,
+          "scrubber_media_url": "https://v.redd.it/s0czzkm85fyg1/CMAF_96.mp4",
+          "dash_url": "https://v.redd.it/s0czzkm85fyg1/DASHPlaylist.mpd?a=1783482919%2CYTI2MmYyYzZkMWUxYTA5NDdlMTU5OGVhMjUwM2VkZjczMmFkMmQzYzkxZGQ0MjdhMmFjOTE1MmFkNmFlMjg4Ng%3D%3D&amp;v=1&amp;f=sd",
+          "duration": 16,
+          "hls_url": "https://v.redd.it/s0czzkm85fyg1/HLSPlaylist.m3u8?a=1783482919%2CMzE5YjFiM2YyZDIzMTViZmQzZTQ5ZjZjOWQ0Mjg0MGNiMTRmNTcyMDZiNjQ1ZDkzMTc1YzA5YzBmN2I0NTI0Mg%3D%3D&amp;v=1&amp;f=sd",
+          "is_gif": false,
+          "transcoding_status": "completed"
+        }
+      },
+      "is_reddit_media_domain": true,
+      "is_meta": false,
+      "category": null,
+      "secure_media_embed": {},
+      "link_flair_text": "Generation",
+      "can_mod_post": false,
+      "score": 993,
+      "approved_by": null,
+      "is_created_from_ads_ui": false,
+      "author_premium": false,
+      "thumbnail": "https://external-preview.redd.it/ZmNoZmo3bTg1ZnlnMfrHJCrXXDbNbm9MLJAUuBsJyUz8TTykmJPxX78goGLU.png?width=140&amp;height=73&amp;format=jpg&amp;auto=webp&amp;s=cca9dd79e9062a8cc3a5853671c0b785aa79b866",
+      "edited": 1777600200.0,
+      "author_flair_css_class": null,
+      "author_flair_richtext": [
+        {
+          "a": ":Discord:",
+          "e": "emoji",
+          "u": "https://emoji.redditmedia.com/08m5x9chttjf1_t5_81eyvm/Discord"
+        }
+      ],
+      "gildings": {},
+      "post_hint": "hosted:video",
+      "content_categories": null,
+      "is_self": false,
+      "subreddit_type": "public",
+      "created": 1777597434.0,
+      "link_flair_type": "richtext",
+      "wls": 6,
+      "removed_by_category": null,
+      "banned_by": null,
+      "author_flair_type": "richtext",
+      "domain": "v.redd.it",
+      "allow_live_comments": false,
+      "selftext_html": "&lt;!-- SC_OFF --&gt;&lt;div class=\"md\"&gt;&lt;p&gt;Gemma just crushed Qwen in a local LLM gamedev contest!&lt;/p&gt;\n\n&lt;p&gt;Device: MacBook Pro M5 Max, 64GB RAM&lt;/p&gt;\n\n&lt;p&gt;Qwen 3.6 27B: 32 tokens/sec \u00b7 18m 04s \u00b7 33,946 tokens.&lt;br/&gt;\nGemma 4 31B: 27 tokens/sec \u00b7 3m 51s \u00b7 6,209 tokens.&lt;/p&gt;\n\n&lt;p&gt;So what is more important: tokens per second, or the quality of the final answer?&lt;/p&gt;\n\n&lt;p&gt;Qwen made a very long response and showed more creativity and visual style. But Gemma gave a shorter, clearer, and more logical answer in much less time. In this one-shot Pac-Man gamedev contest, Gemma 4 31B was the clear winner. Its game logic was stronger: click reactions were smoother, and it handled interactions with elements like walls, ghosts, and particle effects better.&lt;/p&gt;\n\n&lt;p&gt;Open Source Local AI Models Server: &lt;a href=\"http://atomic.chat\"&gt;atomic.chat&lt;/a&gt;&lt;/p&gt;\n\n&lt;p&gt;Basic Prompt:&lt;/p&gt;\n\n&lt;p&gt;Create a single standalone HTML file for a complete playable Pac-Man\u2013style neon arcade game.&lt;/p&gt;\n\n&lt;p&gt;Use only HTML, CSS, JavaScript, and one full-page canvas. No external libraries or assets\u2014everything must be procedurally drawn and run immediately in the browser.&lt;/p&gt;\n\n&lt;p&gt;Generate a compact (~21\u00d721) symmetrical maze programmatically (no ASCII). It must be fully connected, playable, and use tile types (wall, path, pellet, power pellet, ghost spawn, Pac-Man spawn, fruit spawn). Ensure no unreachable pellets or invalid spawns.&lt;/p&gt;\n\n&lt;p&gt;Canvas must fill the window. Center and scale the maze dynamically using available space (no fixed tile size). Reserve space for a HUD.&lt;/p&gt;\n\n&lt;p&gt;Game states: title, playing, paused, life lost, level complete, game over. Include controls (keyboard + mobile). Title and game over screens must show instructions.&lt;/p&gt;\n\n&lt;p&gt;Pac-Man: smooth tile movement, queued turns, no diagonal movement, no clipping, wraps through side tunnels, resets after life loss.&lt;/p&gt;\n\n&lt;p&gt;Ghosts (4): simple pathfinding with distinct behaviors, spawn in a central house, exit with delays, move only on valid paths, never freeze.&lt;/p&gt;\n\n&lt;p&gt;Gameplay:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;Pellets (+10), power pellets (+50), fruit (+500), ghost chain scoring (200\u21921600)&lt;/li&gt;\n&lt;li&gt;Power mode (~8s, min 3s): ghosts become edible and return to spawn when eaten&lt;/li&gt;\n&lt;li&gt;Combo multiplier for quick pellet collection&lt;/li&gt;\n&lt;li&gt;3 lives, level progression increases difficulty&lt;/li&gt;\n&lt;li&gt;Store high score in localStorage&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;Extras:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;Fruit spawns near center temporarily&lt;/li&gt;\n&lt;li&gt;Visual polish: neon maze, glowing elements, animations, particles, screen effects&lt;/li&gt;\n&lt;li&gt;HUD: score, high score, lives, level, combo, power timer&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;Technical:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;Use requestAnimationFrame with delta time&lt;/li&gt;\n&lt;li&gt;Keep performance stable (limit particles)&lt;/li&gt;\n&lt;li&gt;No bugs: avoid invalid movement, stuck entities, unreachable areas, or crashes&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;Final output: only the complete HTML code.&lt;/p&gt;\n&lt;/div&gt;&lt;!-- SC_ON --&gt;",
+      "likes": null,
+      "suggested_sort": null,
+      "banned_at_utc": null,
+      "url_overridden_by_dest": "https://v.redd.it/s0czzkm85fyg1",
+      "view_count": null,
+      "archived": false,
+      "no_follow": false,
+      "is_crosspostable": false,
+      "pinned": false,
+      "over_18": false,
+      "preview": {
+        "images": [
+          {
+            "source": {
+              "url": "https://external-preview.redd.it/ZmNoZmo3bTg1ZnlnMfrHJCrXXDbNbm9MLJAUuBsJyUz8TTykmJPxX78goGLU.png?format=pjpg&amp;auto=webp&amp;s=57902dd647fa60e30034c27d8aabea10674b1ce5",
+              "width": 1280,
+              "height": 672
+            },
+            "resolutions": [
+              {
+                "url": "https://external-preview.redd.it/ZmNoZmo3bTg1ZnlnMfrHJCrXXDbNbm9MLJAUuBsJyUz8TTykmJPxX78goGLU.png?width=108&amp;crop=smart&amp;format=pjpg&amp;auto=webp&amp;s=4ee70ff5360bf2632dcdbf256b2e64b192086ced",
+                "width": 108,
+                "height": 56
+              },
+              {
+                "url": "https://external-preview.redd.it/ZmNoZmo3bTg1ZnlnMfrHJCrXXDbNbm9MLJAUuBsJyUz8TTykmJPxX78goGLU.png?width=216&amp;crop=smart&amp;format=pjpg&amp;auto=webp&amp;s=6a358056e7041b9adf5d648f65042903f76ee4b5",
+                "width": 216,
+                "height": 113
+              },
+              {
+                "url": "https://external-preview.redd.it/ZmNoZmo3bTg1ZnlnMfrHJCrXXDbNbm9MLJAUuBsJyUz8TTykmJPxX78goGLU.png?width=320&amp;crop=smart&amp;format=pjpg&amp;auto=webp&amp;s=630d2514dca16bb5b290a2f2262bcd66f6376246",
+                "width": 320,
+                "height": 168
+              },
+              {
+                "url": "https://external-preview.redd.it/ZmNoZmo3bTg1ZnlnMfrHJCrXXDbNbm9MLJAUuBsJyUz8TTykmJPxX78goGLU.png?width=640&amp;crop=smart&amp;format=pjpg&amp;auto=webp&amp;s=3e67a892a774b98e28c6674bb1f7da89a6f45874",
+                "width": 640,
+                "height": 336
+              },
+              {
+                "url": "https://external-preview.redd.it/ZmNoZmo3bTg1ZnlnMfrHJCrXXDbNbm9MLJAUuBsJyUz8TTykmJPxX78goGLU.png?width=960&amp;crop=smart&amp;format=pjpg&amp;auto=webp&amp;s=cf602ca7f48e3d00f67781a3e95538a5ccde0546",
+                "width": 960,
+                "height": 504
+              },
+              {
+                "url": "https://external-preview.redd.it/ZmNoZmo3bTg1ZnlnMfrHJCrXXDbNbm9MLJAUuBsJyUz8TTykmJPxX78goGLU.png?width=1080&amp;crop=smart&amp;format=pjpg&amp;auto=webp&amp;s=d49a5f982dbda8caa0582db4aa6688ae75bd88fa",
+                "width": 1080,
+                "height": 567
+              }
+            ],
+            "variants": {},
+            "id": "ZmNoZmo3bTg1ZnlnMfrHJCrXXDbNbm9MLJAUuBsJyUz8TTykmJPxX78goGLU"
+          }
+        ],
+        "enabled": false
+      },
+      "all_awardings": [],
+      "awarders": [],
+      "media_only": false,
+      "link_flair_template_id": "23bddba8-ff56-11ed-9688-1a11994b71f7",
+      "can_gild": false,
+      "spoiler": false,
+      "locked": false,
+      "author_flair_text": ":Discord:",
+      "treatment_tags": [],
+      "visited": false,
+      "removed_by": null,
+      "mod_note": null,
+      "distinguished": null,
+      "subreddit_id": "t5_81eyvm",
+      "author_is_blocked": false,
+      "mod_reason_by": null,
+      "num_reports": null,
+      "removal_reason": null,
+      "link_flair_background_color": "#b5a3d0",
+      "id": "1t0epei",
+      "is_robot_indexable": true,
+      "report_reasons": null,
+      "author": "gladkos",
+      "discussion_type": null,
+      "num_comments": 182,
+      "send_replies": true,
+      "contest_mode": false,
+      "mod_reports": [],
+      "author_patreon_flair": false,
+      "author_flair_text_color": "dark",
+      "permalink": "/r/LocalLLaMA/comments/1t0epei/qwen_36_27b_vs_gemma_4_31b_making_packman_game/",
+      "stickied": false,
+      "url": "https://v.redd.it/s0czzkm85fyg1",
+      "subreddit_subscribers": 742102,
+      "created_utc": 1777597434.0,
+      "num_crossposts": 1,
+      "media": {
+        "reddit_video": {
+          "bitrate_kbps": 1200,
+          "fallback_url": "https://v.redd.it/s0czzkm85fyg1/CMAF_480.mp4?source=fallback",
+          "has_audio": true,
+          "height": 448,
+          "width": 854,
+          "scrubber_media_url": "https://v.redd.it/s0czzkm85fyg1/CMAF_96.mp4",
+          "dash_url": "https://v.redd.it/s0czzkm85fyg1/DASHPlaylist.mpd?a=1783482919%2CYTI2MmYyYzZkMWUxYTA5NDdlMTU5OGVhMjUwM2VkZjczMmFkMmQzYzkxZGQ0MjdhMmFjOTE1MmFkNmFlMjg4Ng%3D%3D&amp;v=1&amp;f=sd",
+          "duration": 16,
+          "hls_url": "https://v.redd.it/s0czzkm85fyg1/HLSPlaylist.m3u8?a=1783482919%2CMzE5YjFiM2YyZDIzMTViZmQzZTQ5ZjZjOWQ0Mjg0MGNiMTRmNTcyMDZiNjQ1ZDkzMTc1YzA5YzBmN2I0NTI0Mg%3D%3D&amp;v=1&amp;f=sd",
+          "is_gif": false,
+          "transcoding_status": "completed"
+        }
+      },
+      "is_video": true
+    }
+  },
+  {
+    "kind": "t3",
+    "data": {
+      "approved_at_utc": null,
+      "subreddit": "LocalLLaMA",
+      "selftext": "It is crazy that Qwen3.6 27B now matches Sonnet 4.6 on AA's Agentic Index, overtaking Gemini 3.1 Pro Preview, GPT 5.2 and 5.3 as well as MiniMax 2.7. It made gains across all three indices but the way the Coding Index works, I don't think the gains are as apparent as they should be. The Coding Index only uses Terminal Bench Hard and SciCode which are both strange choices. Cleary the training on the 3.6 models out now has focused on agentic use for OpenClaw/Hermes but it's interesting how close to frontier models such a small model can get. Qwen3.6 122B might be epic. . .",
+      "author_fullname": "t2_k6vnr",
+      "saved": false,
+      "mod_reason_title": null,
+      "gilded": 0,
+      "clicked": false,
+      "is_gallery": true,
+      "title": "Qwen 3.6 27B Makes Huge Gains in Agency on Artificial Analysis - Ties with Sonnet 4.6",
+      "link_flair_richtext": [
+        {
+          "e": "text",
+          "t": "Discussion"
+        }
+      ],
+      "subreddit_name_prefixed": "r/LocalLLaMA",
+      "hidden": false,
+      "pwls": 6,
+      "link_flair_css_class": "",
+      "downs": 0,
+      "thumbnail_height": 56,
+      "top_awarded_type": null,
+      "hide_score": false,
+      "media_metadata": {
+        "6voig5pbizwg1": {
+          "status": "valid",
+          "e": "Image",
+          "m": "image/jpg",
+          "p": [
+            {
+              "y": 45,
+              "x": 108,
+              "u": "https://preview.redd.it/6voig5pbizwg1.jpg?width=108&amp;crop=smart&amp;auto=webp&amp;s=8619f8309c0663d019bd6523717930659f8eb563"
+            },
+            {
+              "y": 90,
+              "x": 216,
+              "u": "https://preview.redd.it/6voig5pbizwg1.jpg?width=216&amp;crop=smart&amp;auto=webp&amp;s=567c59f605b9f3645fd22f94045955f59c9df2da"
+            },
+            {
+              "y": 134,
+              "x": 320,
+              "u": "https://preview.redd.it/6voig5pbizwg1.jpg?width=320&amp;crop=smart&amp;auto=webp&amp;s=6cc3bc7505568842164cebb5ef38b155eb6b2400"
+            },
+            {
+              "y": 268,
+              "x": 640,
+              "u": "https://preview.redd.it/6voig5pbizwg1.jpg?width=640&amp;crop=smart&amp;auto=webp&amp;s=8c1438704991a90d40c77f16692732b93e5eafd1"
+            },
+            {
+              "y": 403,
+              "x": 960,
+              "u": "https://preview.redd.it/6voig5pbizwg1.jpg?width=960&amp;crop=smart&amp;auto=webp&amp;s=a42f8f84db69653adcdba5fcdbeea066dd9e78c8"
+            },
+            {
+              "y": 453,
+              "x": 1080,
+              "u": "https://preview.redd.it/6voig5pbizwg1.jpg?width=1080&amp;crop=smart&amp;auto=webp&amp;s=0d5d9370b6bd12e602ba353f65218b7ed043686d"
+            }
+          ],
+          "s": {
+            "y": 966,
+            "x": 2300,
+            "u": "https://preview.redd.it/6voig5pbizwg1.jpg?width=2300&amp;format=pjpg&amp;auto=webp&amp;s=e04a94fffa2924531c93067c68e4c3cb2276f69e"
+          },
+          "id": "6voig5pbizwg1"
+        },
+        "t1swc5pbizwg1": {
+          "status": "valid",
+          "e": "Image",
+          "m": "image/jpg",
+          "p": [
+            {
+              "y": 43,
+              "x": 108,
+              "u": "https://preview.redd.it/t1swc5pbizwg1.jpg?width=108&amp;crop=smart&amp;auto=webp&amp;s=1200afad4aee69e11a73886b0613cc589f0154dd"
+            },
+            {
+              "y": 87,
+              "x": 216,
+              "u": "https://preview.redd.it/t1swc5pbizwg1.jpg?width=216&amp;crop=smart&amp;auto=webp&amp;s=10c4b8c027e77bbe863a28ae3cce59663eb8e3e0"
+            },
+            {
+              "y": 130,
+              "x": 320,
+              "u": "https://preview.redd.it/t1swc5pbizwg1.jpg?width=320&amp;crop=smart&amp;auto=webp&amp;s=8a5c3a9fd4f9d962c78ba0c71dfb9813ffa04eed"
+            },
+            {
+              "y": 260,
+              "x": 640,
+              "u": "https://preview.redd.it/t1swc5pbizwg1.jpg?width=640&amp;crop=smart&amp;auto=webp&amp;s=5fda5b64f49e9cda2682e8f9465ceea88b42bb0d"
+            },
+            {
+              "y": 390,
+              "x": 960,
+              "u": "https://preview.redd.it/t1swc5pbizwg1.jpg?width=960&amp;crop=smart&amp;auto=webp&amp;s=5ba454020a0fa1c402bf5d0354cab622f5c96db0"
+            },
+            {
+              "y": 439,
+              "x": 1080,
+              "u": "https://preview.redd.it/t1swc5pbizwg1.jpg?width=1080&amp;crop=smart&amp;auto=webp&amp;s=1d69abd31ab46b948c41878675db9a52230f98d7"
+            }
+          ],
+          "s": {
+            "y": 932,
+            "x": 2292,
+            "u": "https://preview.redd.it/t1swc5pbizwg1.jpg?width=2292&amp;format=pjpg&amp;auto=webp&amp;s=8c53a52c52278595e3d47b0d377ecd67b8b1c7ea"
+          },
+          "id": "t1swc5pbizwg1"
+        },
+        "h4d49gpbizwg1": {
+          "status": "valid",
+          "e": "Image",
+          "m": "image/jpg",
+          "p": [
+            {
+              "y": 43,
+              "x": 108,
+              "u": "https://preview.redd.it/h4d49gpbizwg1.jpg?width=108&amp;crop=smart&amp;auto=webp&amp;s=57d16a99224b4742477ff7b69f35b66338f65a1a"
+            },
+            {
+              "y": 87,
+              "x": 216,
+              "u": "https://preview.redd.it/h4d49gpbizwg1.jpg?width=216&amp;crop=smart&amp;auto=webp&amp;s=b0dc5a1777b382c0587275332a387080e8e0e7e8"
+            },
+            {
+              "y": 130,
+              "x": 320,
+              "u": "https://preview.redd.it/h4d49gpbizwg1.jpg?width=320&amp;crop=smart&amp;auto=webp&amp;s=8750f10454471bcfc7c6d09a3fd9f44c347f1d69"
+            },
+            {
+              "y": 260,
+              "x": 640,
+              "u": "https://preview.redd.it/h4d49gpbizwg1.jpg?width=640&amp;crop=smart&amp;auto=webp&amp;s=9961a3e0a164c6956e8bc870f797bfd3980aae0b"
+            },
+            {
+              "y": 390,
+              "x": 960,
+              "u": "https://preview.redd.it/h4d49gpbizwg1.jpg?width=960&amp;crop=smart&amp;auto=webp&amp;s=2e94d5e486d63a64359aad96b3ddb63351b4716b"
+            },
+            {
+              "y": 439,
+              "x": 1080,
+              "u": "https://preview.redd.it/h4d49gpbizwg1.jpg?width=1080&amp;crop=smart&amp;auto=webp&amp;s=e54ce8ba62ebe8ad77c52be9f73a5a5ac65512f7"
+            }
+          ],
+          "s": {
+            "y": 928,
+            "x": 2280,
+            "u": "https://preview.redd.it/h4d49gpbizwg1.jpg?width=2280&amp;format=pjpg&amp;auto=webp&amp;s=4d3149a2137ca032b6c1d173c9b7b0f195745bdf"
+          },
+          "id": "h4d49gpbizwg1"
+        }
+      },
+      "name": "t3_1strodp",
+      "quarantine": false,
+      "link_flair_text_color": "light",
+      "upvote_ratio": 0.97,
+      "author_flair_background_color": "",
+      "ups": 683,
+      "domain": "reddit.com",
+      "media_embed": {},
+      "thumbnail_width": 140,
+      "author_flair_template_id": null,
+      "is_original_content": false,
+      "user_reports": [],
+      "secure_media": null,
+      "is_reddit_media_domain": false,
+      "is_meta": false,
+      "category": null,
+      "secure_media_embed": {},
+      "gallery_data": {
+        "items": [
+          {
+            "media_id": "t1swc5pbizwg1",
+            "is_deleted": false,
+            "id": 919839661
+          },
+          {
+            "media_id": "6voig5pbizwg1",
+            "is_deleted": false,
+            "id": 919839662
+          },
+          {
+            "media_id": "h4d49gpbizwg1",
+            "is_deleted": false,
+            "id": 919839663
+          }
+        ]
+      },
+      "link_flair_text": "Discussion",
+      "can_mod_post": false,
+      "score": 683,
+      "approved_by": null,
+      "is_created_from_ads_ui": false,
+      "author_premium": false,
+      "thumbnail": "https://preview.redd.it/t1swc5pbizwg1.jpg?width=140&amp;height=56&amp;auto=webp&amp;s=91125a5dfe5ce95884fb39092f5807ddf1ffd489",
+      "edited": false,
+      "author_flair_css_class": null,
+      "author_flair_richtext": [
+        {
+          "a": ":Discord:",
+          "e": "emoji",
+          "u": "https://emoji.redditmedia.com/08m5x9chttjf1_t5_81eyvm/Discord"
+        }
+      ],
+      "gildings": {},
+      "content_categories": null,
+      "is_self": false,
+      "subreddit_type": "public",
+      "created": 1776970031.0,
+      "link_flair_type": "richtext",
+      "wls": 6,
+      "removed_by_category": null,
+      "banned_by": null,
+      "author_flair_type": "richtext",
+      "total_awards_received": 0,
+      "allow_live_comments": false,
+      "selftext_html": "&lt;!-- SC_OFF --&gt;&lt;div class=\"md\"&gt;&lt;p&gt;It is crazy that Qwen3.6 27B now matches Sonnet 4.6 on AA&amp;#39;s Agentic Index, overtaking Gemini 3.1 Pro Preview, GPT 5.2 and 5.3 as well as MiniMax 2.7. It made gains across all three indices but the way the Coding Index works, I don&amp;#39;t think the gains are as apparent as they should be. The Coding Index only uses Terminal Bench Hard and SciCode which are both strange choices. Cleary the training on the 3.6 models out now has focused on agentic use for OpenClaw/Hermes but it&amp;#39;s interesting how close to frontier models such a small model can get. Qwen3.6 122B might be epic. . .&lt;/p&gt;\n&lt;/div&gt;&lt;!-- SC_ON --&gt;",
+      "likes": null,
+      "suggested_sort": null,
+      "banned_at_utc": null,
+      "url_overridden_by_dest": "https://www.reddit.com/gallery/1strodp",
+      "view_count": null,
+      "archived": false,
+      "no_follow": false,
+      "is_crosspostable": false,
+      "pinned": false,
+      "over_18": false,
+      "all_awardings": [],
+      "awarders": [],
+      "media_only": false,
+      "link_flair_template_id": "5f921ea4-c7bc-11ed-9c23-3a00622979b4",
+      "can_gild": false,
+      "spoiler": false,
+      "locked": false,
+      "author_flair_text": ":Discord:",
+      "treatment_tags": [],
+      "visited": false,
+      "removed_by": null,
+      "mod_note": null,
+      "distinguished": null,
+      "subreddit_id": "t5_81eyvm",
+      "author_is_blocked": false,
+      "mod_reason_by": null,
+      "num_reports": null,
+      "removal_reason": null,
+      "link_flair_background_color": "#646d73",
+      "id": "1strodp",
+      "is_robot_indexable": true,
+      "report_reasons": null,
+      "author": "dionysio211",
+      "discussion_type": null,
+      "num_comments": 177,
+      "send_replies": true,
+      "contest_mode": false,
+      "mod_reports": [],
+      "author_patreon_flair": false,
+      "author_flair_text_color": "dark",
+      "permalink": "/r/LocalLLaMA/comments/1strodp/qwen_36_27b_makes_huge_gains_in_agency_on/",
+      "stickied": false,
+      "url": "https://www.reddit.com/gallery/1strodp",
+      "subreddit_subscribers": 742102,
+      "created_utc": 1776970031.0,
+      "num_crossposts": 0,
+      "media": null,
+      "is_video": false
+    }
+  },
+  {
+    "kind": "t3",
+    "data": {
+      "approved_at_utc": null,
+      "subreddit": "LocalLLaMA",
+      "selftext": "Evaluated Qwen 3.6 27B across BF16, Q4\\_K\\_M, and Q8\\_0 GGUF quant variants with llama-cpp-python using Neo AI Engineer.\n\nBenchmarks used:\n\n* HumanEval: code generation\n* HellaSwag: commonsense reasoning\n* BFCL: function calling\n\nTotal samples:\n\n* HumanEval: 164\n* HellaSwag: 100\n* BFCL: 400\n\nResults:\n\n**BF16**\n\n* HumanEval: 56.10% 92/164\n* HellaSwag: 90.00% 90/100\n* BFCL: 63.25% 253/400\n* Avg accuracy: 69.78%\n* Throughput: 15.5 tok/s\n* Peak RAM: 54 GB\n* Model size: 53.8 GB\n\n**Q4\\_K\\_M**\n\n* HumanEval: 50.61% 83/164\n* HellaSwag: 86.00% 86/100\n* BFCL: 63.00% 252/400\n* Avg accuracy: 66.54%\n* Throughput: 22.5 tok/s\n* Peak RAM: 28 GB\n* Model size: 16.8 GB\n\n**Q8\\_0**\n\n* HumanEval: 52.44% 86/164\n* HellaSwag: 83.00% 83/100\n* BFCL: 63.00% 252/400\n* Avg accuracy: 66.15%\n* Throughput: 18.0 tok/s\n* Peak RAM: 42 GB\n* Model size: 28.6 GB\n\n**What stood out:**\n\nQ4\\_K\\_M looks like the best practical variant here. It keeps BFCL almost identical to BF16, drops about 5.5 points on HumanEval, and is still only 4 points behind BF16 on HellaSwag.\n\nThe tradeoff is pretty good:\n\n* 1.45x faster than BF16\n* 48% less peak RAM\n* 68.8% smaller model file\n* nearly identical function calling score\n\nQ8\\_0 was a bit underwhelming in this run. It improved HumanEval over Q4\\_K\\_M by \\~1.8 points, but used 42 GB RAM vs 28 GB and was slower. It also scored lower than Q4\\_K\\_M on HellaSwag in this eval.\n\nFor local/CPU deployment, I would probably pick Q4\\_K\\_M unless the workload is heavily code-generation focused. For maximum quality, BF16 still wins.\n\nEvaluation setup:\n\n* GGUF via llama-cpp-python\n* n\\_ctx: 32768\n* checkpointed evaluation\n* HumanEval, HellaSwag, and BFCL all completed\n* BFCL had 400 function calling samples\n\nThis evaluation was done using Neo AI Engineer, which built the GGUF eval setup, handled checkpointed runs, and consolidated the benchmark results. I manually reviewed the outcome as well.\n\nComplete case study with benchmarking results, approach and code snippets in mentioned in the comments below \ud83d\udc47",
+      "author_fullname": "t2_6leknyp4",
+      "saved": false,
+      "mod_reason_title": null,
+      "gilded": 0,
+      "clicked": false,
+      "title": "Qwen 3.6 27B BF16 vs Q4_K_M vs Q8_0 GGUF evaluation",
+      "link_flair_richtext": [
+        {
+          "e": "text",
+          "t": "Discussion"
+        }
+      ],
+      "subreddit_name_prefixed": "r/LocalLLaMA",
+      "hidden": false,
+      "pwls": 6,
+      "link_flair_css_class": "",
+      "downs": 0,
+      "thumbnail_height": 122,
+      "top_awarded_type": null,
+      "hide_score": false,
+      "name": "t3_1sxzqry",
+      "quarantine": false,
+      "link_flair_text_color": "light",
+      "upvote_ratio": 0.93,
+      "author_flair_background_color": null,
+      "ups": 722,
+      "total_awards_received": 0,
+      "media_embed": {},
+      "thumbnail_width": 140,
+      "author_flair_template_id": null,
+      "is_original_content": false,
+      "user_reports": [],
+      "secure_media": null,
+      "is_reddit_media_domain": true,
+      "is_meta": false,
+      "category": null,
+      "secure_media_embed": {},
+      "link_flair_text": "Discussion",
+      "can_mod_post": false,
+      "score": 722,
+      "approved_by": null,
+      "is_created_from_ads_ui": false,
+      "author_premium": false,
+      "thumbnail": "https://preview.redd.it/ncwdmp21bxxg1.jpeg?width=140&amp;height=122&amp;auto=webp&amp;s=608ae1ed0dd729236e3ceb244b94976843f915ac",
+      "edited": false,
+      "author_flair_css_class": null,
+      "author_flair_richtext": [],
+      "gildings": {},
+      "post_hint": "image",
+      "content_categories": null,
+      "is_self": false,
+      "subreddit_type": "public",
+      "created": 1777378717.0,
+      "link_flair_type": "richtext",
+      "wls": 6,
+      "removed_by_category": null,
+      "banned_by": null,
+      "author_flair_type": "text",
+      "domain": "i.redd.it",
+      "allow_live_comments": false,
+      "selftext_html": "&lt;!-- SC_OFF --&gt;&lt;div class=\"md\"&gt;&lt;p&gt;Evaluated Qwen 3.6 27B across BF16, Q4_K_M, and Q8_0 GGUF quant variants with llama-cpp-python using Neo AI Engineer.&lt;/p&gt;\n\n&lt;p&gt;Benchmarks used:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;HumanEval: code generation&lt;/li&gt;\n&lt;li&gt;HellaSwag: commonsense reasoning&lt;/li&gt;\n&lt;li&gt;BFCL: function calling&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;Total samples:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;HumanEval: 164&lt;/li&gt;\n&lt;li&gt;HellaSwag: 100&lt;/li&gt;\n&lt;li&gt;BFCL: 400&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;Results:&lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;BF16&lt;/strong&gt;&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;HumanEval: 56.10% 92/164&lt;/li&gt;\n&lt;li&gt;HellaSwag: 90.00% 90/100&lt;/li&gt;\n&lt;li&gt;BFCL: 63.25% 253/400&lt;/li&gt;\n&lt;li&gt;Avg accuracy: 69.78%&lt;/li&gt;\n&lt;li&gt;Throughput: 15.5 tok/s&lt;/li&gt;\n&lt;li&gt;Peak RAM: 54 GB&lt;/li&gt;\n&lt;li&gt;Model size: 53.8 GB&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;&lt;strong&gt;Q4_K_M&lt;/strong&gt;&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;HumanEval: 50.61% 83/164&lt;/li&gt;\n&lt;li&gt;HellaSwag: 86.00% 86/100&lt;/li&gt;\n&lt;li&gt;BFCL: 63.00% 252/400&lt;/li&gt;\n&lt;li&gt;Avg accuracy: 66.54%&lt;/li&gt;\n&lt;li&gt;Throughput: 22.5 tok/s&lt;/li&gt;\n&lt;li&gt;Peak RAM: 28 GB&lt;/li&gt;\n&lt;li&gt;Model size: 16.8 GB&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;&lt;strong&gt;Q8_0&lt;/strong&gt;&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;HumanEval: 52.44% 86/164&lt;/li&gt;\n&lt;li&gt;HellaSwag: 83.00% 83/100&lt;/li&gt;\n&lt;li&gt;BFCL: 63.00% 252/400&lt;/li&gt;\n&lt;li&gt;Avg accuracy: 66.15%&lt;/li&gt;\n&lt;li&gt;Throughput: 18.0 tok/s&lt;/li&gt;\n&lt;li&gt;Peak RAM: 42 GB&lt;/li&gt;\n&lt;li&gt;Model size: 28.6 GB&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;&lt;strong&gt;What stood out:&lt;/strong&gt;&lt;/p&gt;\n\n&lt;p&gt;Q4_K_M looks like the best practical variant here. It keeps BFCL almost identical to BF16, drops about 5.5 points on HumanEval, and is still only 4 points behind BF16 on HellaSwag.&lt;/p&gt;\n\n&lt;p&gt;The tradeoff is pretty good:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;1.45x faster than BF16&lt;/li&gt;\n&lt;li&gt;48% less peak RAM&lt;/li&gt;\n&lt;li&gt;68.8% smaller model file&lt;/li&gt;\n&lt;li&gt;nearly identical function calling score&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;Q8_0 was a bit underwhelming in this run. It improved HumanEval over Q4_K_M by ~1.8 points, but used 42 GB RAM vs 28 GB and was slower. It also scored lower than Q4_K_M on HellaSwag in this eval.&lt;/p&gt;\n\n&lt;p&gt;For local/CPU deployment, I would probably pick Q4_K_M unless the workload is heavily code-generation focused. For maximum quality, BF16 still wins.&lt;/p&gt;\n\n&lt;p&gt;Evaluation setup:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;GGUF via llama-cpp-python&lt;/li&gt;\n&lt;li&gt;n_ctx: 32768&lt;/li&gt;\n&lt;li&gt;checkpointed evaluation&lt;/li&gt;\n&lt;li&gt;HumanEval, HellaSwag, and BFCL all completed&lt;/li&gt;\n&lt;li&gt;BFCL had 400 function calling samples&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;This evaluation was done using Neo AI Engineer, which built the GGUF eval setup, handled checkpointed runs, and consolidated the benchmark results. I manually reviewed the outcome as well.&lt;/p&gt;\n\n&lt;p&gt;Complete case study with benchmarking results, approach and code snippets in mentioned in the comments below \ud83d\udc47&lt;/p&gt;\n&lt;/div&gt;&lt;!-- SC_ON --&gt;",
+      "likes": null,
+      "suggested_sort": null,
+      "banned_at_utc": null,
+      "url_overridden_by_dest": "https://i.redd.it/ncwdmp21bxxg1.jpeg",
+      "view_count": null,
+      "archived": false,
+      "no_follow": false,
+      "is_crosspostable": false,
+      "pinned": false,
+      "over_18": false,
+      "preview": {
+        "images": [
+          {
+            "source": {
+              "url": "https://preview.redd.it/ncwdmp21bxxg1.jpeg?auto=webp&amp;s=a70b64f743f6fd19e366db425d480ec7a72aa7eb",
+              "width": 1233,
+              "height": 1080
+            },
+            "resolutions": [
+              {
+                "url": "https://preview.redd.it/ncwdmp21bxxg1.jpeg?width=108&amp;crop=smart&amp;auto=webp&amp;s=417d7ce4cb9e46ff2a012386185ef9901cea7eef",
+                "width": 108,
+                "height": 94
+              },
+              {
+                "url": "https://preview.redd.it/ncwdmp21bxxg1.jpeg?width=216&amp;crop=smart&amp;auto=webp&amp;s=791029467624b50427eb8ea8f38c2fa51229930e",
+                "width": 216,
+                "height": 189
+              },
+              {
+                "url": "https://preview.redd.it/ncwdmp21bxxg1.jpeg?width=320&amp;crop=smart&amp;auto=webp&amp;s=38c58e9ea35a1c76dae57d8ec987f5437ed5d8dc",
+                "width": 320,
+                "height": 280
+              },
+              {
+                "url": "https://preview.redd.it/ncwdmp21bxxg1.jpeg?width=640&amp;crop=smart&amp;auto=webp&amp;s=a5b4caef8b59ccd3aae4c95a42b00f9b14365e5e",
+                "width": 640,
+                "height": 560
+              },
+              {
+                "url": "https://preview.redd.it/ncwdmp21bxxg1.jpeg?width=960&amp;crop=smart&amp;auto=webp&amp;s=5be46a1d8c5e4de0ea385cc8345dd408d6c86c5e",
+                "width": 960,
+                "height": 840
+              },
+              {
+                "url": "https://preview.redd.it/ncwdmp21bxxg1.jpeg?width=1080&amp;crop=smart&amp;auto=webp&amp;s=346bb8caf099687af1f1cfdc43e56557bfb9910b",
+                "width": 1080,
+                "height": 945
+              }
+            ],
+            "variants": {},
+            "id": "ncwdmp21bxxg1"
+          }
+        ],
+        "enabled": true
+      },
+      "all_awardings": [],
+      "awarders": [],
+      "media_only": false,
+      "link_flair_template_id": "5f921ea4-c7bc-11ed-9c23-3a00622979b4",
+      "can_gild": false,
+      "spoiler": false,
+      "locked": false,
+      "author_flair_text": null,
+      "treatment_tags": [],
+      "visited": false,
+      "removed_by": null,
+      "mod_note": null,
+      "distinguished": null,
+      "subreddit_id": "t5_81eyvm",
+      "author_is_blocked": false,
+      "mod_reason_by": null,
+      "num_reports": null,
+      "removal_reason": null,
+      "link_flair_background_color": "#646d73",
+      "id": "1sxzqry",
+      "is_robot_indexable": true,
+      "report_reasons": null,
+      "author": "gvij",
+      "discussion_type": null,
+      "num_comments": 161,
+      "send_replies": true,
+      "contest_mode": false,
+      "mod_reports": [],
+      "author_patreon_flair": false,
+      "author_flair_text_color": null,
+      "permalink": "/r/LocalLLaMA/comments/1sxzqry/qwen_36_27b_bf16_vs_q4_k_m_vs_q8_0_gguf_evaluation/",
+      "stickied": false,
+      "url": "https://i.redd.it/ncwdmp21bxxg1.jpeg",
+      "subreddit_subscribers": 742102,
+      "created_utc": 1777378717.0,
+      "num_crossposts": 0,
+      "media": null,
+      "is_video": false
+    }
+  },
+  {
+    "kind": "t3",
+    "data": {
+      "approved_at_utc": null,
+      "subreddit": "LocalLLaMA",
+      "selftext": "The following is a non-comprehensive test I came up with to test the quality difference (a.k.a degradation) between different quantizations of Qwen 3.6 27B. I want to figure out what's the best quant to run on my 16 GB VRAM setup.\n\n**WHAT WE ARE TESTING**\n\nFirst, the prompt:\n\n    Given this PGN string of a chess game:\n    \n    1. b3 e5 2. Nf3 h5 3. d4 exd4 4. Nxd4 Nf6 5. f4 Ke7 6. Qd3 d5 7. h4 *\n    \n    Figure out the current state of the chessboard, create an image in SVG code, also highlight the last move.   \n\nI want to see if the models can:\n\n* Able to track the state of the board after each move, to reach the final state (first half of move 7)\n* Generate the right SVG image of the board, correctly place the pieces, highlight the last move\n\nAnd yes, if you are questioning. It could be possible that the model was trained to do the same thing on existing chess games, so I came up with some random moves, the kind of moves that no players above 300 elo would ever have played.\n\nFor those who are not chess players, this is how the board supposed to look like after move 7. h4. Btw, you supposed to look at the pieces positions and the board orientation, not image quality because this is just a screenshot from Lichess.\n\nhttps://preview.redd.it/6lsfvzy8wfzg1.png?width=1586&amp;format=png&amp;auto=webp&amp;s=94634b461528a6ecc6728eefd23072ab28c3769d\n\n**CAN OTHER MODELS SOLVE IT?**\n\nBefore we go to the main part, let me show the result from some other models. I find it interesting that not many models were able to figure out the board state, let alone rendering it correctly.\n\n  \n**Qwen 3.5 27B**\n\nIt was mostly figured out the final position of the pieces, but still render the original board state on top. Highlighted the wrong squares, and the board orientation is wrong.\n\nhttps://preview.redd.it/oanbebp9xfzg1.png?width=1078&amp;format=png&amp;auto=webp&amp;s=b72af75a10f4a9f4d897699b404580370bd29d9e\n\n**Gemma 4 31B**\n\nNice chess dot com flagship board style, i would say it can figure out the board state, but failed to render it correctly. The square pattern also messed up.\n\nhttps://preview.redd.it/w5jwi05nxfzg1.png?width=1640&amp;format=png&amp;auto=webp&amp;s=33e6f21f56c4e98df92c828103ac10714e578973\n\n**Qwen3 Coder Next**\n\nI don't know what to say, quite disappointed.\n\nhttps://preview.redd.it/knltp8h1yfzg1.png?width=1348&amp;format=png&amp;auto=webp&amp;s=1e9207cd1dfd08b049eaa13727703be732d2cb96\n\n**Qwen3.6 35B A3B**\n\nAs expected, 35B always be the fastest Qwen model, but at the same time, managed to fail the task successfully in many different ways. This is why I decided to find a way to squeeze 27B into my 16 GB card. The speed alone just not worth it.\n\nhttps://preview.redd.it/orti5kdhyfzg1.png?width=3360&amp;format=png&amp;auto=webp&amp;s=c29a3aae9683e5ceaa15c59ae32adecabdd1b6b6\n\n**HOW QWEN3.6 27B SOLVE IT?**\n\nAll the models here are tested with the same set of llama.cpp parameters:\n\n* temp 0.6\n* top-p 0.95\n* top-k 20\n* min-p 0.0\n* presence\\_penalty 1.0\n* context window 65536\n\nBF16 version was from OpenRouter, Q8 to Q4\\_K\\_XL versions was on a L40S server, the rest are on my RTX 5060 Ti.\n\nThe SVG code generated directly on Llama.cpp Web UI without any tools or MCP enabled (I originally ran this test in Pi agent, only to found out that the model tried to peek into the parent folders and found the existing SVG diagrams by higher quants, copied most of it).\n\n**BF16 - Full precision**\n\nThis is the baseline of this test. It has everything I needed: right position, right board orientation, right piece colors, right highlight. The dotted blue line was unexpected, but it also interesting, because later on you will see, not many of the high quants generate this.\n\nhttps://preview.redd.it/lgizkjklzfzg1.png?width=1424&amp;format=png&amp;auto=webp&amp;s=d7867b55735d3d875e0e36aecbaf3c3f0d1dbd58\n\n**Q8\\_0**\n\nAs expected Q8 retains pretty much everything from the full precision except the line.\n\nhttps://preview.redd.it/6wjnq6ff0gzg1.png?width=1610&amp;format=png&amp;auto=webp&amp;s=f0d20ff4717b972efffced49ac8d43075fa97eb5\n\n**Q6\\_K**\n\nWe start to see some quality loss here. I mean the placement of the rank 5 pawns. The look of the pieces are mostly because Q6 decided to use a different font. None of the models here trying to draw its own pieces in this test.\n\nhttps://preview.redd.it/kcqj81vl0gzg1.png?width=1608&amp;format=png&amp;auto=webp&amp;s=66c7a219e79a8f6ecf44e27489f337b4016185b5\n\n**Q5\\_K\\_XL**\n\nLooks very similar with Q8, but it is worth noticing that the SVG code of Q5 version is 7.1 KB, while Q8 is 4.7 KB.\n\nhttps://preview.redd.it/6wshu7g01gzg1.png?width=1506&amp;format=png&amp;auto=webp&amp;s=289db354fea59c456d8bd2dc7abdbcc1e4282ffd\n\n**Q4\\_K\\_XL and IQ4\\_XS**\n\nIf you ignore the font choice, you will see Q4\\_K\\_XL is a more complete solution, because it has the board coordinates.\n\nhttps://preview.redd.it/pzdghdtm1gzg1.png?width=3326&amp;format=png&amp;auto=webp&amp;s=10c3d7758459f223d195107353f1ec76565cd31d\n\n**Q3\\_K\\_XL and Q3\\_K\\_M**\n\nhttps://preview.redd.it/56gttur62gzg1.png?width=3330&amp;format=png&amp;auto=webp&amp;s=4af27d8a652e2deef6c14485d0fff4bd3651097f\n\n**IQ3\\_XXS**\n\nNow here's the interesting part, everything was mostly correct, the piece placements and the highlight, and there's the line on the last move!\n\nBut IQ3\\_XXS get the board orientation wrong, see the light square on the bottom left?\n\nhttps://preview.redd.it/7jnzxy324gzg1.png?width=1608&amp;format=png&amp;auto=webp&amp;s=178f72f51e65866497f16e861b04c0c448fce774\n\n**Q2\\_K\\_XL**\n\nThis is just a waste of time. But hey, it got all the pieces positions right. The board is just not aligned at all.\n\nhttps://preview.redd.it/3z63d7bv4gzg1.png?width=1604&amp;format=png&amp;auto=webp&amp;s=f6723b28248327c55bede4e42a4a0cfbe962fb74\n\n**SO, WHAT DO I USE?**\n\nI know a single test is not enough to draw any conclusion here. But personally, I will never go for anything below IQ4\\_XS after this test (I had bad experience with Q3\\_K\\_XL and below in other tries).\n\nOn my RTX 5060 Ti, I got like **pp 100 tps** and **tg 8 tps** for IQ4\\_XS with vanilla llama.cpp (q8 for both ctk and ctv, fit on). But with TheTom's TurboQuant fork, I managed to get up to **pp 760 tps** and **tg 22 tps**, by forcing GPU offload for all layers (\\`-ngl 99\\`), quite usable.\n\n    llama-cpp-turboquant/build/bin/llama-server -fa 1 -c 75000 -np 1 --no-mmap --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.0 --presence_penalty 1.0 -ctk turbo4 -ctv turbo2 -ub 128 -b 256 -m Qwen3.6-27B-IQ4_XS.gguf -ngl 99 \n\nThe only down side is I have to keep the context window below 75k, and use turbo4/turbo2 for KV cache quant. \n\nBelow are some example of different KV cache quants.\n\nhttps://preview.redd.it/y0y7o6h09gzg1.png?width=3320&amp;format=png&amp;auto=webp&amp;s=bd7c855100ff63c9bb666a4f4a61b966ad6eebca\n\nhttps://preview.redd.it/dyrru7z19gzg1.png?width=3314&amp;format=png&amp;auto=webp&amp;s=d54238d7a31c6cd8858f84df67ff588dc22d726b\n\nYou can see all the result directly here [https://qwen3-6-27b-benchmark.vercel.app/](https://qwen3-6-27b-benchmark.vercel.app/)",
+      "author_fullname": "t2_rupoh3qw",
+      "saved": false,
+      "mod_reason_title": null,
+      "gilded": 0,
+      "clicked": false,
+      "title": "Quality comparison between Qwen 3.6 27B quantizations (BF16, Q8_0, Q6_K, Q5_K_XL, Q4_K_XL, IQ4_XS, IQ3_XXS,...)",
+      "link_flair_richtext": [
+        {
+          "e": "text",
+          "t": "Resources"
+        }
+      ],
+      "subreddit_name_prefixed": "r/LocalLLaMA",
+      "hidden": false,
+      "pwls": 6,
+      "link_flair_css_class": "",
+      "downs": 0,
+      "thumbnail_height": 140,
+      "top_awarded_type": null,
+      "hide_score": false,
+      "media_metadata": {
+        "6lsfvzy8wfzg1": {
+          "status": "valid",
+          "e": "Image",
+          "m": "image/png",
+          "p": [
+            {
+              "y": 108,
+              "x": 108,
+              "u": "https://preview.redd.it/6lsfvzy8wfzg1.png?width=108&amp;crop=smart&amp;auto=webp&amp;s=bcc11f53c3a02c94ba64224dbf8799005bac15db"
+            },
+            {
+              "y": 216,
+              "x": 216,
+              "u": "https://preview.redd.it/6lsfvzy8wfzg1.png?width=216&amp;crop=smart&amp;auto=webp&amp;s=dad1a882d249cf07ecb25608818f015515c2ee9c"
+            },
+            {
+              "y": 320,
+              "x": 320,
+              "u": "https://preview.redd.it/6lsfvzy8wfzg1.png?width=320&amp;crop=smart&amp;auto=webp&amp;s=cd830f8e00dbb5a45b81268c0f24442738287e8c"
+            },
+            {
+              "y": 640,
+              "x": 640,
+              "u": "https://preview.redd.it/6lsfvzy8wfzg1.png?width=640&amp;crop=smart&amp;auto=webp&amp;s=d654466682c08f5d69203985000e7b7ebfe56784"
+            },
+            {
+              "y": 960,
+              "x": 960,
+              "u": "https://preview.redd.it/6lsfvzy8wfzg1.png?width=960&amp;crop=smart&amp;auto=webp&amp;s=2110204321ee80b10646f115c5e9a489301b0085"
+            },
+            {
+              "y": 1080,
+              "x": 1080,
+              "u": "https://preview.redd.it/6lsfvzy8wfzg1.png?width=1080&amp;crop=smart&amp;auto=webp&amp;s=3093f7c39ef6e86d9a692958d89a1e31b635b44f"
+            }
+          ],
+          "s": {
+            "y": 1586,
+            "x": 1586,
+            "u": "https://preview.redd.it/6lsfvzy8wfzg1.png?width=1586&amp;format=png&amp;auto=webp&amp;s=94634b461528a6ecc6728eefd23072ab28c3769d"
+          },
+          "id": "6lsfvzy8wfzg1"
+        },
+        "knltp8h1yfzg1": {
+          "status": "valid",
+          "e": "Image",
+          "m": "image/png",
+          "p": [
+            {
+              "y": 108,
+              "x": 108,
+              "u": "https://preview.redd.it/knltp8h1yfzg1.png?width=108&amp;crop=smart&amp;auto=webp&amp;s=45e5df7ba2037df3142b0648e34bb956fff46291"
+            },
+            {
+              "y": 216,
+              "x": 216,
+              "u": "https://preview.redd.it/knltp8h1yfzg1.png?width=216&amp;crop=smart&amp;auto=webp&amp;s=05278002204008965d271ed6d2c0c3fa12c9dfcf"
+            },
+            {
+              "y": 320,
+              "x": 320,
+              "u": "https://preview.redd.it/knltp8h1yfzg1.png?width=320&amp;crop=smart&amp;auto=webp&amp;s=7ccbf6153188823bf23454e88dee0876ebbbde66"
+            },
+            {
+              "y": 640,
+              "x": 640,
+              "u": "https://preview.redd.it/knltp8h1yfzg1.png?width=640&amp;crop=smart&amp;auto=webp&amp;s=3bd943c581a3afc2d2dc8537572390e7a1c2b8f2"
+            },
+            {
+              "y": 961,
+              "x": 960,
+              "u": "https://preview.redd.it/knltp8h1yfzg1.png?width=960&amp;crop=smart&amp;auto=webp&amp;s=f9f6af9241177a4339e9af93ec231f34c79456e2"
+            },
+            {
+              "y": 1081,
+              "x": 1080,
+              "u": "https://preview.redd.it/knltp8h1yfzg1.png?width=1080&amp;crop=smart&amp;auto=webp&amp;s=d1f94829f15889e85517d41224f05d629fc07c90"
+            }
+          ],
+          "s": {
+            "y": 1350,
+            "x": 1348,
+            "u": "https://preview.redd.it/knltp8h1yfzg1.png?width=1348&amp;format=png&amp;auto=webp&amp;s=1e9207cd1dfd08b049eaa13727703be732d2cb96"
+          },
+          "id": "knltp8h1yfzg1"
+        },
+        "y0y7o6h09gzg1": {
+          "status": "valid",
+          "e": "Image",
+          "m": "image/png",
+          "p": [
+            {
+              "y": 55,
+              "x": 108,
+              "u": "https://preview.redd.it/y0y7o6h09gzg1.png?width=108&amp;crop=smart&amp;auto=webp&amp;s=918a72e475396753508f4663799738c6456ff126"
+            },
+            {
+              "y": 111,
+              "x": 216,
+              "u": "https://preview.redd.it/y0y7o6h09gzg1.png?width=216&amp;crop=smart&amp;auto=webp&amp;s=a1cc4bcc07e665f158972a1a8b0477c88c3f9e8b"
+            },
+            {
+              "y": 165,
+              "x": 320,
+              "u": "https://preview.redd.it/y0y7o6h09gzg1.png?width=320&amp;crop=smart&amp;auto=webp&amp;s=b1e7afb473cca73ffc9ce5408fc5995200360e02"
+            },
+            {
+              "y": 330,
+              "x": 640,
+              "u": "https://preview.redd.it/y0y7o6h09gzg1.png?width=640&amp;crop=smart&amp;auto=webp&amp;s=ecc0dacdbfb6c5497db8e2ac0b003181ac11635a"
+            },
+            {
+              "y": 495,
+              "x": 960,
+              "u": "https://preview.redd.it/y0y7o6h09gzg1.png?width=960&amp;crop=smart&amp;auto=webp&amp;s=577dd4ab5e5ee8fa79b04458f3d88ebe10505346"
+            },
+            {
+              "y": 556,
+              "x": 1080,
+              "u": "https://preview.redd.it/y0y7o6h09gzg1.png?width=1080&amp;crop=smart&amp;auto=webp&amp;s=761f4c99cfbdcaf6a5c8cbd179b271be9bedc602"
+            }
+          ],
+          "s": {
+            "y": 1712,
+            "x": 3320,
+            "u": "https://preview.redd.it/y0y7o6h09gzg1.png?width=3320&amp;format=png&amp;auto=webp&amp;s=bd7c855100ff63c9bb666a4f4a61b966ad6eebca"
+          },
+          "id": "y0y7o6h09gzg1"
+        },
+        "oanbebp9xfzg1": {
+          "status": "valid",
+          "e": "Image",
+          "m": "image/png",
+          "p": [
+            {
+              "y": 107,
+              "x": 108,
+              "u": "https://preview.redd.it/oanbebp9xfzg1.png?width=108&amp;crop=smart&amp;auto=webp&amp;s=32649fcaf4db71e1f6fbbea97e7c8b9e82dbe33a"
+            },
+            {
+              "y": 214,
+              "x": 216,
+              "u": "https://preview.redd.it/oanbebp9xfzg1.png?width=216&amp;crop=smart&amp;auto=webp&amp;s=6c851f96b1709c48136c1b6bc356714b34173e5a"
+            },
+            {
+              "y": 318,
+              "x": 320,
+              "u": "https://preview.redd.it/oanbebp9xfzg1.png?width=320&amp;crop=smart&amp;auto=webp&amp;s=d4d1d46946935088bb2d62dd25fadb259d65becb"
+            },
+            {
+              "y": 636,
+              "x": 640,
+              "u": "https://preview.redd.it/oanbebp9xfzg1.png?width=640&amp;crop=smart&amp;auto=webp&amp;s=da80dc5c15069fb4bfd78c36779ba42bbeca31a7"
+            },
+            {
+              "y": 954,
+              "x": 960,
+              "u": "https://preview.redd.it/oanbebp9xfzg1.png?width=960&amp;crop=smart&amp;auto=webp&amp;s=f7e1e2b8b981d7f0beb8722458c891cb40125448"
+            }
+          ],
+          "s": {
+            "y": 1072,
+            "x": 1078,
+            "u": "https://preview.redd.it/oanbebp9xfzg1.png?width=1078&amp;format=png&amp;auto=webp&amp;s=b72af75a10f4a9f4d897699b404580370bd29d9e"
+          },
+          "id": "oanbebp9xfzg1"
+        },
+        "orti5kdhyfzg1": {
+          "status": "valid",
+          "e": "Image",
+          "m": "image/png",
+          "p": [
+            {
+              "y": 42,
+              "x": 108,
+              "u": "https://preview.redd.it/orti5kdhyfzg1.png?width=108&amp;crop=smart&amp;auto=webp&amp;s=634e78a628276be7c50a7826e35940ecc3264770"
+            },
+            {
+              "y": 85,
+              "x": 216,
+              "u": "https://preview.redd.it/orti5kdhyfzg1.png?width=216&amp;crop=smart&amp;auto=webp&amp;s=b6fe1559b6b683b6f99bbffba245b3d7919fde41"
+            },
+            {
+              "y": 127,
+              "x": 320,
+              "u": "https://preview.redd.it/orti5kdhyfzg1.png?width=320&amp;crop=smart&amp;auto=webp&amp;s=0188db5d1371e69c90466d5eb9ec43c0ed2a82fa"
+            },
+            {
+              "y": 254,
+              "x": 640,
+              "u": "https://preview.redd.it/orti5kdhyfzg1.png?width=640&amp;crop=smart&amp;auto=webp&amp;s=bad092272fa3fee15d32f4e35dc098e2ecf559e6"
+            },
+            {
+              "y": 381,
+              "x": 960,
+              "u": "https://preview.redd.it/orti5kdhyfzg1.png?width=960&amp;crop=smart&amp;auto=webp&amp;s=0dcb632f8455eb714d537e7770ceea4a7c39a6b3"
+            },
+            {
+              "y": 429,
+              "x": 1080,
+              "u": "https://preview.redd.it/orti5kdhyfzg1.png?width=1080&amp;crop=smart&amp;auto=webp&amp;s=f23b8fa14ec90463d7f7dd7c11823a83e3240539"
+            }
+          ],
+          "s": {
+            "y": 1336,
+            "x": 3360,
+            "u": "https://preview.redd.it/orti5kdhyfzg1.png?width=3360&amp;format=png&amp;auto=webp&amp;s=c29a3aae9683e5ceaa15c59ae32adecabdd1b6b6"
+          },
+          "id": "orti5kdhyfzg1"
+        },
+        "w5jwi05nxfzg1": {
+          "status": "valid",
+          "e": "Image",
+          "m": "image/png",
+          "p": [
+            {
+              "y": 107,
+              "x": 108,
+              "u": "https://preview.redd.it/w5jwi05nxfzg1.png?width=108&amp;crop=smart&amp;auto=webp&amp;s=1d6086972b1eeb66ba49f541f5b883f153a76896"
+            },
+            {
+              "y": 215,
+              "x": 216,
+              "u": "https://preview.redd.it/w5jwi05nxfzg1.png?width=216&amp;crop=smart&amp;auto=webp&amp;s=f4ef98010d7fe6c4076152393f6b0129bd078d68"
+            },
+            {
+              "y": 319,
+              "x": 320,
+              "u": "https://preview.redd.it/w5jwi05nxfzg1.png?width=320&amp;crop=smart&amp;auto=webp&amp;s=70d373ec5d4d513b66302bd3b4a5e2d73761b4c6"
+            },
+            {
+              "y": 639,
+              "x": 640,
+              "u": "https://preview.redd.it/w5jwi05nxfzg1.png?width=640&amp;crop=smart&amp;auto=webp&amp;s=6cda5d237d268b3abe5e028c9c75d765d096a9a8"
+            },
+            {
+              "y": 958,
+              "x": 960,
+              "u": "https://preview.redd.it/w5jwi05nxfzg1.png?width=960&amp;crop=smart&amp;auto=webp&amp;s=77372865b57744139e632156f6e1b9bd6efb132c"
+            },
+            {
+              "y": 1078,
+              "x": 1080,
+              "u": "https://preview.redd.it/w5jwi05nxfzg1.png?width=1080&amp;crop=smart&amp;auto=webp&amp;s=afb00eaf47355e91ab70dcd0610a4e48b63a4cce"
+            }
+          ],
+          "s": {
+            "y": 1638,
+            "x": 1640,
+            "u": "https://preview.redd.it/w5jwi05nxfzg1.png?width=1640&amp;format=png&amp;auto=webp&amp;s=33e6f21f56c4e98df92c828103ac10714e578973"
+          },
+          "id": "w5jwi05nxfzg1"
+        },
+        "56gttur62gzg1": {
+          "status": "valid",
+          "e": "Image",
+          "m": "image/png",
+          "p": [
+            {
+              "y": 55,
+              "x": 108,
+              "u": "https://preview.redd.it/56gttur62gzg1.png?width=108&amp;crop=smart&amp;auto=webp&amp;s=c6f8312a8843d3069b4cf828fc920c0a217ba7a2"
+            },
+            {
+              "y": 111,
+              "x": 216,
+              "u": "https://preview.redd.it/56gttur62gzg1.png?width=216&amp;crop=smart&amp;auto=webp&amp;s=bf373f8f0e8dad230eefe29412b12b4a1c1584ab"
+            },
+            {
+              "y": 165,
+              "x": 320,
+              "u": "https://preview.redd.it/56gttur62gzg1.png?width=320&amp;crop=smart&amp;auto=webp&amp;s=3aa0633ae88244f61edceaf06173ddb7e0c2dd98"
+            },
+            {
+              "y": 331,
+              "x": 640,
+              "u": "https://preview.redd.it/56gttur62gzg1.png?width=640&amp;crop=smart&amp;auto=webp&amp;s=f259b6904c5b9bae2012f6b2ae13c4259e51a907"
+            },
+            {
+              "y": 497,
+              "x": 960,
+              "u": "https://preview.redd.it/56gttur62gzg1.png?width=960&amp;crop=smart&amp;auto=webp&amp;s=213fb5a783c601192fb51040f869e5f242042be4"
+            },
+            {
+              "y": 559,
+              "x": 1080,
+              "u": "https://preview.redd.it/56gttur62gzg1.png?width=1080&amp;crop=smart&amp;auto=webp&amp;s=e307d89e9c17145eb660fb04aa3c97b718782f35"
+            }
+          ],
+          "s": {
+            "y": 1724,
+            "x": 3330,
+            "u": "https://preview.redd.it/56gttur62gzg1.png?width=3330&amp;format=png&amp;auto=webp&amp;s=4af27d8a652e2deef6c14485d0fff4bd3651097f"
+          },
+          "id": "56gttur62gzg1"
+        },
+        "7jnzxy324gzg1": {
+          "status": "valid",
+          "e": "Image",
+          "m": "image/png",
+          "p": [
+            {
+              "y": 107,
+              "x": 108,
+              "u": "https://preview.redd.it/7jnzxy324gzg1.png?width=108&amp;crop=smart&amp;auto=webp&amp;s=47c659e983768b9cab083ee9adef74ee6adb7780"
+            },
+            {
+              "y": 215,
+              "x": 216,
+              "u": "https://preview.redd.it/7jnzxy324gzg1.png?width=216&amp;crop=smart&amp;auto=webp&amp;s=990d8c8ff41d46f6c4ee6f264d8e8f698d2e94c6"
+            },
+            {
+              "y": 319,
+              "x": 320,
+              "u": "https://preview.redd.it/7jnzxy324gzg1.png?width=320&amp;crop=smart&amp;auto=webp&amp;s=ca4c3a3873a1a7c12be1b78864eae0fa784d6c08"
+            },
+            {
+              "y": 639,
+              "x": 640,
+              "u": "https://preview.redd.it/7jnzxy324gzg1.png?width=640&amp;crop=smart&amp;auto=webp&amp;s=3d6f06c82ee68e1da0aca0500027a74f156ae3a5"
+            },
+            {
+              "y": 958,
+              "x": 960,
+              "u": "https://preview.redd.it/7jnzxy324gzg1.png?width=960&amp;crop=smart&amp;auto=webp&amp;s=01759c14798e023de3f96f589cb6d90855f74e39"
+            },
+            {
+              "y": 1078,
+              "x": 1080,
+              "u": "https://preview.redd.it/7jnzxy324gzg1.png?width=1080&amp;crop=smart&amp;auto=webp&amp;s=a6ebecb2405d4aad3346bab497ea98b6371c80f5"
+            }
+          ],
+          "s": {
+            "y": 1606,
+            "x": 1608,
+            "u": "https://preview.redd.it/7jnzxy324gzg1.png?width=1608&amp;format=png&amp;auto=webp&amp;s=178f72f51e65866497f16e861b04c0c448fce774"
+          },
+          "id": "7jnzxy324gzg1"
+        },
+        "3z63d7bv4gzg1": {
+          "status": "valid",
+          "e": "Image",
+          "m": "image/png",
+          "p": [
+            {
+              "y": 108,
+              "x": 108,
+              "u": "https://preview.redd.it/3z63d7bv4gzg1.png?width=108&amp;crop=smart&amp;auto=webp&amp;s=2851b81905f7b43c6c5af85334df5adc548342a5"
+            },
+            {
+              "y": 216,
+              "x": 216,
+              "u": "https://preview.redd.it/3z63d7bv4gzg1.png?width=216&amp;crop=smart&amp;auto=webp&amp;s=38996c399ceb46dcc7f1fdd17f2e4729c0a369f7"
+            },
+            {
+              "y": 320,
+              "x": 320,
+              "u": "https://preview.redd.it/3z63d7bv4gzg1.png?width=320&amp;crop=smart&amp;auto=webp&amp;s=a73252ee493382cc23e3f017229a3c063c069bc4"
+            },
+            {
+              "y": 640,
+              "x": 640,
+              "u": "https://preview.redd.it/3z63d7bv4gzg1.png?width=640&amp;crop=smart&amp;auto=webp&amp;s=103fed4f49f5c1a2e8364744695fcef30e4d6a48"
+            },
+            {
+              "y": 960,
+              "x": 960,
+              "u": "https://preview.redd.it/3z63d7bv4gzg1.png?width=960&amp;crop=smart&amp;auto=webp&amp;s=1393637a85d33f348f5ae8ec578b2ec68179bb5a"
+            },
+            {
+              "y": 1080,
+              "x": 1080,
+              "u": "https://preview.redd.it/3z63d7bv4gzg1.png?width=1080&amp;crop=smart&amp;auto=webp&amp;s=c7a4394f6529704a28d0c46fbd9fc70010a703d1"
+            }
+          ],
+          "s": {
+            "y": 1604,
+            "x": 1604,
+            "u": "https://preview.redd.it/3z63d7bv4gzg1.png?width=1604&amp;format=png&amp;auto=webp&amp;s=f6723b28248327c55bede4e42a4a0cfbe962fb74"
+          },
+          "id": "3z63d7bv4gzg1"
+        },
+        "6wjnq6ff0gzg1": {
+          "status": "valid",
+          "e": "Image",
+          "m": "image/png",
+          "p": [
+            {
+              "y": 111,
+              "x": 108,
+              "u": "https://preview.redd.it/6wjnq6ff0gzg1.png?width=108&amp;crop=smart&amp;auto=webp&amp;s=22d2402d91d32815d70138102bd309cd4ea74e1f"
+            },
+            {
+              "y": 223,
+              "x": 216,
+              "u": "https://preview.redd.it/6wjnq6ff0gzg1.png?width=216&amp;crop=smart&amp;auto=webp&amp;s=d4cf7dbbd5dd6815016d7cbdf98f8a946a32cd2b"
+            },
+            {
+              "y": 331,
+              "x": 320,
+              "u": "https://preview.redd.it/6wjnq6ff0gzg1.png?width=320&amp;crop=smart&amp;auto=webp&amp;s=37cf20682931e48c2dcf4ce06ed3d5ea6ce5ed76"
+            },
+            {
+              "y": 663,
+              "x": 640,
+              "u": "https://preview.redd.it/6wjnq6ff0gzg1.png?width=640&amp;crop=smart&amp;auto=webp&amp;s=d39bd270dcba69de68df410e9ac3f5619d2b33a9"
+            },
+            {
+              "y": 994,
+              "x": 960,
+              "u": "https://preview.redd.it/6wjnq6ff0gzg1.png?width=960&amp;crop=smart&amp;auto=webp&amp;s=76d2f949fd8940bd51c2d9428faafcaac41d7267"
+            },
+            {
+              "y": 1118,
+              "x": 1080,
+              "u": "https://preview.redd.it/6wjnq6ff0gzg1.png?width=1080&amp;crop=smart&amp;auto=webp&amp;s=f4f91626c9744b1100df0bd2437a15c9cb57e1b8"
+            }
+          ],
+          "s": {
+            "y": 1668,
+            "x": 1610,
+            "u": "https://preview.redd.it/6wjnq6ff0gzg1.png?width=1610&amp;format=png&amp;auto=webp&amp;s=f0d20ff4717b972efffced49ac8d43075fa97eb5"
+          },
+          "id": "6wjnq6ff0gzg1"
+        },
+        "pzdghdtm1gzg1": {
+          "status": "valid",
+          "e": "Image",
+          "m": "image/png",
+          "p": [
+            {
+              "y": 55,
+              "x": 108,
+              "u": "https://preview.redd.it/pzdghdtm1gzg1.png?width=108&amp;crop=smart&amp;auto=webp&amp;s=b81833b4eff868ece738a76774e12800d30d9cc3"
+            },
+            {
+              "y": 111,
+              "x": 216,
+              "u": "https://preview.redd.it/pzdghdtm1gzg1.png?width=216&amp;crop=smart&amp;auto=webp&amp;s=5e4a9c52b43aca34fb24c555ea2e8c8944b14240"
+            },
+            {
+              "y": 165,
+              "x": 320,
+              "u": "https://preview.redd.it/pzdghdtm1gzg1.png?width=320&amp;crop=smart&amp;auto=webp&amp;s=6ba28ccf06fb4fcc2262833882532d4ee475cf3b"
+            },
+            {
+              "y": 330,
+              "x": 640,
+              "u": "https://preview.redd.it/pzdghdtm1gzg1.png?width=640&amp;crop=smart&amp;auto=webp&amp;s=1626b67319bddf0d4e92b7c66ef7ac7384d68f84"
+            },
+            {
+              "y": 496,
+              "x": 960,
+              "u": "https://preview.redd.it/pzdghdtm1gzg1.png?width=960&amp;crop=smart&amp;auto=webp&amp;s=5b7ed1dc4e7da65f6ee98b84c23b913bae126d67"
+            },
+            {
+              "y": 558,
+              "x": 1080,
+              "u": "https://preview.redd.it/pzdghdtm1gzg1.png?width=1080&amp;crop=smart&amp;auto=webp&amp;s=01e85027187246734a83e25e0cca96520da16346"
+            }
+          ],
+          "s": {
+            "y": 1720,
+            "x": 3326,
+            "u": "https://preview.redd.it/pzdghdtm1gzg1.png?width=3326&amp;format=png&amp;auto=webp&amp;s=10c3d7758459f223d195107353f1ec76565cd31d"
+          },
+          "id": "pzdghdtm1gzg1"
+        },
+        "6wshu7g01gzg1": {
+          "status": "valid",
+          "e": "Image",
+          "m": "image/png",
+          "p": [
+            {
+              "y": 108,
+              "x": 108,
+              "u": "https://preview.redd.it/6wshu7g01gzg1.png?width=108&amp;crop=smart&amp;auto=webp&amp;s=21b94e966ef3f20d1c50828af04adb3d1437dfdc"
+            },
+            {
+              "y": 216,
+              "x": 216,
+              "u": "https://preview.redd.it/6wshu7g01gzg1.png?width=216&amp;crop=smart&amp;auto=webp&amp;s=d5ffceeb8932728a70da932ade3cd253d8c9a88b"
+            },
+            {
+              "y": 320,
+              "x": 320,
+              "u": "https://preview.redd.it/6wshu7g01gzg1.png?width=320&amp;crop=smart&amp;auto=webp&amp;s=dda15da89a1a4dacd76f0c8664f10ae9d79b82a6"
+            },
+            {
+              "y": 640,
+              "x": 640,
+              "u": "https://preview.redd.it/6wshu7g01gzg1.png?width=640&amp;crop=smart&amp;auto=webp&amp;s=787ffa07dbd511a581d3ae2681bf8292e7ee0c86"
+            },
+            {
+              "y": 961,
+              "x": 960,
+              "u": "https://preview.redd.it/6wshu7g01gzg1.png?width=960&amp;crop=smart&amp;auto=webp&amp;s=4d3764836eb8e225d009fd6d55bcf612949d6ef6"
+            },
+            {
+              "y": 1081,
+              "x": 1080,
+              "u": "https://preview.redd.it/6wshu7g01gzg1.png?width=1080&amp;crop=smart&amp;auto=webp&amp;s=3b90abdd2bacf6f185ad8f916b0787877cf53854"
+            }
+          ],
+          "s": {
+            "y": 1508,
+            "x": 1506,
+            "u": "https://preview.redd.it/6wshu7g01gzg1.png?width=1506&amp;format=png&amp;auto=webp&amp;s=289db354fea59c456d8bd2dc7abdbcc1e4282ffd"
+          },
+          "id": "6wshu7g01gzg1"
+        },
+        "kcqj81vl0gzg1": {
+          "status": "valid",
+          "e": "Image",
+          "m": "image/png",
+          "p": [
+            {
+              "y": 111,
+              "x": 108,
+              "u": "https://preview.redd.it/kcqj81vl0gzg1.png?width=108&amp;crop=smart&amp;auto=webp&amp;s=a58516d14d38eceef415ac5b7ea1e762a27427a7"
+            },
+            {
+              "y": 223,
+              "x": 216,
+              "u": "https://preview.redd.it/kcqj81vl0gzg1.png?width=216&amp;crop=smart&amp;auto=webp&amp;s=f17bdfa352229a9efe46393306b90ff7339dbe9a"
+            },
+            {
+              "y": 331,
+              "x": 320,
+              "u": "https://preview.redd.it/kcqj81vl0gzg1.png?width=320&amp;crop=smart&amp;auto=webp&amp;s=2780aa5109e103ff172f0a413119a0bab994fe89"
+            },
+            {
+              "y": 662,
+              "x": 640,
+              "u": "https://preview.redd.it/kcqj81vl0gzg1.png?width=640&amp;crop=smart&amp;auto=webp&amp;s=e4d045ae3e8e6eadff5e68bbf57e3c8a99b424b7"
+            },
+            {
+              "y": 993,
+              "x": 960,
+              "u": "https://preview.redd.it/kcqj81vl0gzg1.png?width=960&amp;crop=smart&amp;auto=webp&amp;s=d21f6edc00553eee995f0077d24821ea77f152c9"
+            },
+            {
+              "y": 1117,
+              "x": 1080,
+              "u": "https://preview.redd.it/kcqj81vl0gzg1.png?width=1080&amp;crop=smart&amp;auto=webp&amp;s=5eff16a6e0069be83bc65e7d05753d61b602eb5a"
+            }
+          ],
+          "s": {
+            "y": 1664,
+            "x": 1608,
+            "u": "https://preview.redd.it/kcqj81vl0gzg1.png?width=1608&amp;format=png&amp;auto=webp&amp;s=66c7a219e79a8f6ecf44e27489f337b4016185b5"
+          },
+          "id": "kcqj81vl0gzg1"
+        },
+        "dyrru7z19gzg1": {
+          "status": "valid",
+          "e": "Image",
+          "m": "image/png",
+          "p": [
+            {
+              "y": 55,
+              "x": 108,
+              "u": "https://preview.redd.it/dyrru7z19gzg1.png?width=108&amp;crop=smart&amp;auto=webp&amp;s=04b786f1f0ccec52232063de8e78bd1894126fab"
+            },
+            {
+              "y": 111,
+              "x": 216,
+              "u": "https://preview.redd.it/dyrru7z19gzg1.png?width=216&amp;crop=smart&amp;auto=webp&amp;s=cfaaac5c0393c544a4be6fc97c29968c85ec85fe"
+            },
+            {
+              "y": 164,
+              "x": 320,
+              "u": "https://preview.redd.it/dyrru7z19gzg1.png?width=320&amp;crop=smart&amp;auto=webp&amp;s=0029972bbf79ec8905b509c2f4eaeaf7bb168433"
+            },
+            {
+              "y": 329,
+              "x": 640,
+              "u": "https://preview.redd.it/dyrru7z19gzg1.png?width=640&amp;crop=smart&amp;auto=webp&amp;s=f5ecf33d1548cb6d4d5f74f055ae7371a60c3227"
+            },
+            {
+              "y": 494,
+              "x": 960,
+              "u": "https://preview.redd.it/dyrru7z19gzg1.png?width=960&amp;crop=smart&amp;auto=webp&amp;s=91075a7b90adbbc08abed8fc5de32fe080730ec0"
+            },
+            {
+              "y": 555,
+              "x": 1080,
+              "u": "https://preview.redd.it/dyrru7z19gzg1.png?width=1080&amp;crop=smart&amp;auto=webp&amp;s=71aa68d0cc62efc3dcecc1c2643db330c5e43d7a"
+            }
+          ],
+          "s": {
+            "y": 1706,
+            "x": 3314,
+            "u": "https://preview.redd.it/dyrru7z19gzg1.png?width=3314&amp;format=png&amp;auto=webp&amp;s=d54238d7a31c6cd8858f84df67ff588dc22d726b"
+          },
+          "id": "dyrru7z19gzg1"
+        },
+        "lgizkjklzfzg1": {
+          "status": "valid",
+          "e": "Image",
+          "m": "image/png",
+          "p": [
+            {
+              "y": 116,
+              "x": 108,
+              "u": "https://preview.redd.it/lgizkjklzfzg1.png?width=108&amp;crop=smart&amp;auto=webp&amp;s=487f33d6514f96510a6406ad2051e8179f2fd65b"
+            },
+            {
+              "y": 233,
+              "x": 216,
+              "u": "https://preview.redd.it/lgizkjklzfzg1.png?width=216&amp;crop=smart&amp;auto=webp&amp;s=e89d70f1d24fba27b9e52433a53ca6cc0e79599d"
+            },
+            {
+              "y": 346,
+              "x": 320,
+              "u": "https://preview.redd.it/lgizkjklzfzg1.png?width=320&amp;crop=smart&amp;auto=webp&amp;s=dc5718db15a6158223aab30c5bc0b8946244144b"
+            },
+            {
+              "y": 693,
+              "x": 640,
+              "u": "https://preview.redd.it/lgizkjklzfzg1.png?width=640&amp;crop=smart&amp;auto=webp&amp;s=abdbd8435c56058857f2dfc82256a33bb431173c"
+            },
+            {
+              "y": 1039,
+              "x": 960,
+              "u": "https://preview.redd.it/lgizkjklzfzg1.png?width=960&amp;crop=smart&amp;auto=webp&amp;s=2009f1fdf99842f8b36741ea188bcf32259ff203"
+            },
+            {
+              "y": 1169,
+              "x": 1080,
+              "u": "https://preview.redd.it/lgizkjklzfzg1.png?width=1080&amp;crop=smart&amp;auto=webp&amp;s=119768eb49e0679b74beea1bbfe60f4e94e2e9fd"
+            }
+          ],
+          "s": {
+            "y": 1542,
+            "x": 1424,
+            "u": "https://preview.redd.it/lgizkjklzfzg1.png?width=1424&amp;format=png&amp;auto=webp&amp;s=d7867b55735d3d875e0e36aecbaf3c3f0d1dbd58"
+          },
+          "id": "lgizkjklzfzg1"
+        }
+      },
+      "name": "t3_1t53dhp",
+      "quarantine": false,
+      "link_flair_text_color": "light",
+      "upvote_ratio": 0.97,
+      "author_flair_background_color": "",
+      "subreddit_type": "public",
+      "ups": 584,
+      "total_awards_received": 0,
+      "media_embed": {},
+      "thumbnail_width": 140,
+      "author_flair_template_id": null,
+      "is_original_content": false,
+      "user_reports": [],
+      "secure_media": null,
+      "is_reddit_media_domain": false,
+      "is_meta": false,
+      "category": null,
+      "secure_media_embed": {},
+      "link_flair_text": "Resources",
+      "can_mod_post": false,
+      "score": 584,
+      "approved_by": null,
+      "is_created_from_ads_ui": false,
+      "author_premium": false,
+      "thumbnail": "https://preview.redd.it/6lsfvzy8wfzg1.png?width=140&amp;height=140&amp;auto=webp&amp;s=402390b430a99e66da354bdfa4689f6a68dc03b6",
+      "edited": false,
+      "author_flair_css_class": null,
+      "author_flair_richtext": [
+        {
+          "a": ":Discord:",
+          "e": "emoji",
+          "u": "https://emoji.redditmedia.com/08m5x9chttjf1_t5_81eyvm/Discord"
+        }
+      ],
+      "gildings": {},
+      "content_categories": null,
+      "is_self": true,
+      "mod_note": null,
+      "created": 1778044227.0,
+      "link_flair_type": "richtext",
+      "wls": 6,
+      "removed_by_category": null,
+      "banned_by": null,
+      "author_flair_type": "richtext",
+      "domain": "self.LocalLLaMA",
+      "allow_live_comments": false,
+      "selftext_html": "&lt;!-- SC_OFF --&gt;&lt;div class=\"md\"&gt;&lt;p&gt;The following is a non-comprehensive test I came up with to test the quality difference (a.k.a degradation) between different quantizations of Qwen 3.6 27B. I want to figure out what&amp;#39;s the best quant to run on my 16 GB VRAM setup.&lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;WHAT WE ARE TESTING&lt;/strong&gt;&lt;/p&gt;\n\n&lt;p&gt;First, the prompt:&lt;/p&gt;\n\n&lt;pre&gt;&lt;code&gt;Given this PGN string of a chess game:\n\n1. b3 e5 2. Nf3 h5 3. d4 exd4 4. Nxd4 Nf6 5. f4 Ke7 6. Qd3 d5 7. h4 *\n\nFigure out the current state of the chessboard, create an image in SVG code, also highlight the last move.   \n&lt;/code&gt;&lt;/pre&gt;\n\n&lt;p&gt;I want to see if the models can:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;Able to track the state of the board after each move, to reach the final state (first half of move 7)&lt;/li&gt;\n&lt;li&gt;Generate the right SVG image of the board, correctly place the pieces, highlight the last move&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;And yes, if you are questioning. It could be possible that the model was trained to do the same thing on existing chess games, so I came up with some random moves, the kind of moves that no players above 300 elo would ever have played.&lt;/p&gt;\n\n&lt;p&gt;For those who are not chess players, this is how the board supposed to look like after move 7. h4. Btw, you supposed to look at the pieces positions and the board orientation, not image quality because this is just a screenshot from Lichess.&lt;/p&gt;\n\n&lt;p&gt;&lt;a href=\"https://preview.redd.it/6lsfvzy8wfzg1.png?width=1586&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=94634b461528a6ecc6728eefd23072ab28c3769d\"&gt;https://preview.redd.it/6lsfvzy8wfzg1.png?width=1586&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=94634b461528a6ecc6728eefd23072ab28c3769d&lt;/a&gt;&lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;CAN OTHER MODELS SOLVE IT?&lt;/strong&gt;&lt;/p&gt;\n\n&lt;p&gt;Before we go to the main part, let me show the result from some other models. I find it interesting that not many models were able to figure out the board state, let alone rendering it correctly.&lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;Qwen 3.5 27B&lt;/strong&gt;&lt;/p&gt;\n\n&lt;p&gt;It was mostly figured out the final position of the pieces, but still render the original board state on top. Highlighted the wrong squares, and the board orientation is wrong.&lt;/p&gt;\n\n&lt;p&gt;&lt;a href=\"https://preview.redd.it/oanbebp9xfzg1.png?width=1078&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=b72af75a10f4a9f4d897699b404580370bd29d9e\"&gt;https://preview.redd.it/oanbebp9xfzg1.png?width=1078&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=b72af75a10f4a9f4d897699b404580370bd29d9e&lt;/a&gt;&lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;Gemma 4 31B&lt;/strong&gt;&lt;/p&gt;\n\n&lt;p&gt;Nice chess dot com flagship board style, i would say it can figure out the board state, but failed to render it correctly. The square pattern also messed up.&lt;/p&gt;\n\n&lt;p&gt;&lt;a href=\"https://preview.redd.it/w5jwi05nxfzg1.png?width=1640&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=33e6f21f56c4e98df92c828103ac10714e578973\"&gt;https://preview.redd.it/w5jwi05nxfzg1.png?width=1640&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=33e6f21f56c4e98df92c828103ac10714e578973&lt;/a&gt;&lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;Qwen3 Coder Next&lt;/strong&gt;&lt;/p&gt;\n\n&lt;p&gt;I don&amp;#39;t know what to say, quite disappointed.&lt;/p&gt;\n\n&lt;p&gt;&lt;a href=\"https://preview.redd.it/knltp8h1yfzg1.png?width=1348&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=1e9207cd1dfd08b049eaa13727703be732d2cb96\"&gt;https://preview.redd.it/knltp8h1yfzg1.png?width=1348&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=1e9207cd1dfd08b049eaa13727703be732d2cb96&lt;/a&gt;&lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;Qwen3.6 35B A3B&lt;/strong&gt;&lt;/p&gt;\n\n&lt;p&gt;As expected, 35B always be the fastest Qwen model, but at the same time, managed to fail the task successfully in many different ways. This is why I decided to find a way to squeeze 27B into my 16 GB card. The speed alone just not worth it.&lt;/p&gt;\n\n&lt;p&gt;&lt;a href=\"https://preview.redd.it/orti5kdhyfzg1.png?width=3360&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=c29a3aae9683e5ceaa15c59ae32adecabdd1b6b6\"&gt;https://preview.redd.it/orti5kdhyfzg1.png?width=3360&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=c29a3aae9683e5ceaa15c59ae32adecabdd1b6b6&lt;/a&gt;&lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;HOW QWEN3.6 27B SOLVE IT?&lt;/strong&gt;&lt;/p&gt;\n\n&lt;p&gt;All the models here are tested with the same set of llama.cpp parameters:&lt;/p&gt;\n\n&lt;ul&gt;\n&lt;li&gt;temp 0.6&lt;/li&gt;\n&lt;li&gt;top-p 0.95&lt;/li&gt;\n&lt;li&gt;top-k 20&lt;/li&gt;\n&lt;li&gt;min-p 0.0&lt;/li&gt;\n&lt;li&gt;presence_penalty 1.0&lt;/li&gt;\n&lt;li&gt;context window 65536&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;BF16 version was from OpenRouter, Q8 to Q4_K_XL versions was on a L40S server, the rest are on my RTX 5060 Ti.&lt;/p&gt;\n\n&lt;p&gt;The SVG code generated directly on Llama.cpp Web UI without any tools or MCP enabled (I originally ran this test in Pi agent, only to found out that the model tried to peek into the parent folders and found the existing SVG diagrams by higher quants, copied most of it).&lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;BF16 - Full precision&lt;/strong&gt;&lt;/p&gt;\n\n&lt;p&gt;This is the baseline of this test. It has everything I needed: right position, right board orientation, right piece colors, right highlight. The dotted blue line was unexpected, but it also interesting, because later on you will see, not many of the high quants generate this.&lt;/p&gt;\n\n&lt;p&gt;&lt;a href=\"https://preview.redd.it/lgizkjklzfzg1.png?width=1424&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=d7867b55735d3d875e0e36aecbaf3c3f0d1dbd58\"&gt;https://preview.redd.it/lgizkjklzfzg1.png?width=1424&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=d7867b55735d3d875e0e36aecbaf3c3f0d1dbd58&lt;/a&gt;&lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;Q8_0&lt;/strong&gt;&lt;/p&gt;\n\n&lt;p&gt;As expected Q8 retains pretty much everything from the full precision except the line.&lt;/p&gt;\n\n&lt;p&gt;&lt;a href=\"https://preview.redd.it/6wjnq6ff0gzg1.png?width=1610&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=f0d20ff4717b972efffced49ac8d43075fa97eb5\"&gt;https://preview.redd.it/6wjnq6ff0gzg1.png?width=1610&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=f0d20ff4717b972efffced49ac8d43075fa97eb5&lt;/a&gt;&lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;Q6_K&lt;/strong&gt;&lt;/p&gt;\n\n&lt;p&gt;We start to see some quality loss here. I mean the placement of the rank 5 pawns. The look of the pieces are mostly because Q6 decided to use a different font. None of the models here trying to draw its own pieces in this test.&lt;/p&gt;\n\n&lt;p&gt;&lt;a href=\"https://preview.redd.it/kcqj81vl0gzg1.png?width=1608&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=66c7a219e79a8f6ecf44e27489f337b4016185b5\"&gt;https://preview.redd.it/kcqj81vl0gzg1.png?width=1608&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=66c7a219e79a8f6ecf44e27489f337b4016185b5&lt;/a&gt;&lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;Q5_K_XL&lt;/strong&gt;&lt;/p&gt;\n\n&lt;p&gt;Looks very similar with Q8, but it is worth noticing that the SVG code of Q5 version is 7.1 KB, while Q8 is 4.7 KB.&lt;/p&gt;\n\n&lt;p&gt;&lt;a href=\"https://preview.redd.it/6wshu7g01gzg1.png?width=1506&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=289db354fea59c456d8bd2dc7abdbcc1e4282ffd\"&gt;https://preview.redd.it/6wshu7g01gzg1.png?width=1506&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=289db354fea59c456d8bd2dc7abdbcc1e4282ffd&lt;/a&gt;&lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;Q4_K_XL and IQ4_XS&lt;/strong&gt;&lt;/p&gt;\n\n&lt;p&gt;If you ignore the font choice, you will see Q4_K_XL is a more complete solution, because it has the board coordinates.&lt;/p&gt;\n\n&lt;p&gt;&lt;a href=\"https://preview.redd.it/pzdghdtm1gzg1.png?width=3326&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=10c3d7758459f223d195107353f1ec76565cd31d\"&gt;https://preview.redd.it/pzdghdtm1gzg1.png?width=3326&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=10c3d7758459f223d195107353f1ec76565cd31d&lt;/a&gt;&lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;Q3_K_XL and Q3_K_M&lt;/strong&gt;&lt;/p&gt;\n\n&lt;p&gt;&lt;a href=\"https://preview.redd.it/56gttur62gzg1.png?width=3330&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=4af27d8a652e2deef6c14485d0fff4bd3651097f\"&gt;https://preview.redd.it/56gttur62gzg1.png?width=3330&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=4af27d8a652e2deef6c14485d0fff4bd3651097f&lt;/a&gt;&lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;IQ3_XXS&lt;/strong&gt;&lt;/p&gt;\n\n&lt;p&gt;Now here&amp;#39;s the interesting part, everything was mostly correct, the piece placements and the highlight, and there&amp;#39;s the line on the last move!&lt;/p&gt;\n\n&lt;p&gt;But IQ3_XXS get the board orientation wrong, see the light square on the bottom left?&lt;/p&gt;\n\n&lt;p&gt;&lt;a href=\"https://preview.redd.it/7jnzxy324gzg1.png?width=1608&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=178f72f51e65866497f16e861b04c0c448fce774\"&gt;https://preview.redd.it/7jnzxy324gzg1.png?width=1608&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=178f72f51e65866497f16e861b04c0c448fce774&lt;/a&gt;&lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;Q2_K_XL&lt;/strong&gt;&lt;/p&gt;\n\n&lt;p&gt;This is just a waste of time. But hey, it got all the pieces positions right. The board is just not aligned at all.&lt;/p&gt;\n\n&lt;p&gt;&lt;a href=\"https://preview.redd.it/3z63d7bv4gzg1.png?width=1604&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=f6723b28248327c55bede4e42a4a0cfbe962fb74\"&gt;https://preview.redd.it/3z63d7bv4gzg1.png?width=1604&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=f6723b28248327c55bede4e42a4a0cfbe962fb74&lt;/a&gt;&lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;SO, WHAT DO I USE?&lt;/strong&gt;&lt;/p&gt;\n\n&lt;p&gt;I know a single test is not enough to draw any conclusion here. But personally, I will never go for anything below IQ4_XS after this test (I had bad experience with Q3_K_XL and below in other tries).&lt;/p&gt;\n\n&lt;p&gt;On my RTX 5060 Ti, I got like &lt;strong&gt;pp 100 tps&lt;/strong&gt; and &lt;strong&gt;tg 8 tps&lt;/strong&gt; for IQ4_XS with vanilla llama.cpp (q8 for both ctk and ctv, fit on). But with TheTom&amp;#39;s TurboQuant fork, I managed to get up to &lt;strong&gt;pp 760 tps&lt;/strong&gt; and &lt;strong&gt;tg 22 tps&lt;/strong&gt;, by forcing GPU offload for all layers (`-ngl 99`), quite usable.&lt;/p&gt;\n\n&lt;pre&gt;&lt;code&gt;llama-cpp-turboquant/build/bin/llama-server -fa 1 -c 75000 -np 1 --no-mmap --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.0 --presence_penalty 1.0 -ctk turbo4 -ctv turbo2 -ub 128 -b 256 -m Qwen3.6-27B-IQ4_XS.gguf -ngl 99 \n&lt;/code&gt;&lt;/pre&gt;\n\n&lt;p&gt;The only down side is I have to keep the context window below 75k, and use turbo4/turbo2 for KV cache quant. &lt;/p&gt;\n\n&lt;p&gt;Below are some example of different KV cache quants.&lt;/p&gt;\n\n&lt;p&gt;&lt;a href=\"https://preview.redd.it/y0y7o6h09gzg1.png?width=3320&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=bd7c855100ff63c9bb666a4f4a61b966ad6eebca\"&gt;https://preview.redd.it/y0y7o6h09gzg1.png?width=3320&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=bd7c855100ff63c9bb666a4f4a61b966ad6eebca&lt;/a&gt;&lt;/p&gt;\n\n&lt;p&gt;&lt;a href=\"https://preview.redd.it/dyrru7z19gzg1.png?width=3314&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=d54238d7a31c6cd8858f84df67ff588dc22d726b\"&gt;https://preview.redd.it/dyrru7z19gzg1.png?width=3314&amp;amp;format=png&amp;amp;auto=webp&amp;amp;s=d54238d7a31c6cd8858f84df67ff588dc22d726b&lt;/a&gt;&lt;/p&gt;\n\n&lt;p&gt;You can see all the result directly here &lt;a href=\"https://qwen3-6-27b-benchmark.vercel.app/\"&gt;https://qwen3-6-27b-benchmark.vercel.app/&lt;/a&gt;&lt;/p&gt;\n&lt;/div&gt;&lt;!-- SC_ON --&gt;",
+      "likes": null,
+      "suggested_sort": null,
+      "banned_at_utc": null,
+      "view_count": null,
+      "archived": false,
+      "no_follow": false,
+      "is_crosspostable": false,
+      "pinned": false,
+      "over_18": false,
+      "all_awardings": [],
+      "awarders": [],
+      "media_only": false,
+      "link_flair_template_id": "ab9120c4-bf8e-11ed-ae5e-2eb8b7c7e10b",
+      "can_gild": false,
+      "spoiler": false,
+      "locked": false,
+      "author_flair_text": ":Discord:",
+      "treatment_tags": [],
+      "visited": false,
+      "removed_by": null,
+      "num_reports": null,
+      "distinguished": null,
+      "subreddit_id": "t5_81eyvm",
+      "author_is_blocked": false,
+      "mod_reason_by": null,
+      "removal_reason": null,
+      "link_flair_background_color": "#ccac2b",
+      "id": "1t53dhp",
+      "is_robot_indexable": true,
+      "report_reasons": null,
+      "author": "bobaburger",
+      "discussion_type": null,
+      "num_comments": 187,
+      "send_replies": true,
+      "contest_mode": false,
+      "mod_reports": [],
+      "author_patreon_flair": false,
+      "author_flair_text_color": "dark",
+      "permalink": "/r/LocalLLaMA/comments/1t53dhp/quality_comparison_between_qwen_36_27b/",
+      "stickied": false,
+      "url": "https://www.reddit.com/r/LocalLLaMA/comments/1t53dhp/quality_comparison_between_qwen_36_27b/",
+      "subreddit_subscribers": 742102,
+      "created_utc": 1778044227.0,
+      "num_crossposts": 1,
+      "media": null,
+      "is_video": false
+    }
+  },
+  {
+    "kind": "t3",
+    "data": {
+      "approved_at_utc": null,
+      "subreddit": "LocalLLaMA",
+      "selftext": "TL;DR New llama.cpp fork! I wanted a Windows-friendly inference to run Qwen 3.6 27B **Q5** on a single RTX 3090 with speculative decoding, high context without excess quantization, and vision enabled. No option did this out of the box for me without VRAM and/or tooling issues (this was before MTP PR for llama.cpp surfaced there).\n\nSo I pulled out an old trick: stay up to 4 a.m. one too many times to do month+ work in a week or two. I probably lost a decent amount of hair while trying to make this all work, but now I have what seems to be a proper solution and don't mind to share.\n\n# Anbeeld's BeeLlama.cpp\n\nhttps://preview.redd.it/lqjgiw1bx40h1.jpg?width=1800&amp;format=pjpg&amp;auto=webp&amp;s=3b68c16e78d36a1089a14f31b338aa78b8a1c073\n\n**GitHub repo:** [**https://github.com/Anbeeld/beellama.cpp**](https://github.com/Anbeeld/beellama.cpp)\n\nBeeLlama.cpp (or just Bee) is a performance-focused llama.cpp fork for squeezing more speed and context out of local GGUF inference. It keeps the familiar llama.cpp tools and server flow, then adds DFlash speculative decoding, adaptive draft control, TurboQuant/TCQ KV-cache compression, and reasoning-loop protection, with full multimodal support.\n\n&gt;Not quite a pegasus, but close enough.\n\nHere's a [plug-and-play Qwen 3.6 27B setup](https://github.com/Anbeeld/beellama.cpp/blob/main/docs/quickstart-qwen36-dflash.md) with a config to run it in Q5 + 200k of practically lossless KV cache + vision on a single RTX 3090 or 4090.\n\n# Fork Features\n\n* **DFlash speculative decoding**: `--spec-type dflash` drives a DFlash draft GGUF alongside the target model. The target captures hidden states into a per-layer 4096-slot ring buffer, the drafter cross-attends to the most recent `--spec-dflash-cross-ctx` hidden-state tokens and proposes drafts for target verification.\n* **TurboQuant / TCQ KV-cache compression**: Five cache types (`turbo2`, `turbo3`, `turbo4`, `turbo2_tcq`, `turbo3_tcq`) spanning from 4x to 7.5x compression, with higher-bit options being practically lossless in many cases. Set independently with `--cache-type-k` and `--cache-type-v`.\n* **Adaptive draft-max control**: The server adjusts the active draft horizon at runtime instead of using a fixed `--spec-draft-n-max`. The default `profit` controller compares speculative throughput against a no-spec baseline; the `fringe` alternative maps acceptance-rate bands to draft depth.\n* **Full multimodal support**: When `--mmproj` is active, the server keeps flat DFlash available for text generation. The model can be fully offloaded to CPU with no problems to reduce VRAM pressure.\n* **Reasoning-loop protection**: The server detects repeated hidden reasoning output and intervenes. Default mode is `force-close` with `--reasoning-loop-window` and `--reasoning-loop-max-period` tuning available.\n* **Sampled DFlash verification**: `--spec-draft-temp` enables rejection-sampling drafter behavior. Activates when both draft and target temperature exceed zero. Draft log probabilities must be available for rejection sampling to produce correct output.\n* **DDTree branch verification**: optional `--spec-branch-budget` adds branch nodes beyond the main draft path with GPU `parent_ids`, tree masks, and recurrent tree kernels. Disabled automatically when the target model spans more than one GPU. This one is very much work in progress!\n* **Request-level speculative overrides**: Draft-max and branch budget can be overridden per-request through JSON fields without restarting the server.\n* **CopySpec model-free speculation**: `--spec-type copyspec` provides rolling-hash suffix matching over previous tokens without a draft model.\n\nFor the full feature and public-repo comparison, read [docs/beellama-features.md](https://github.com/Anbeeld/beellama.cpp/blob/main/docs/beellama-features.md). For the complete argument reference, read [docs/beellama-args.md](https://github.com/Anbeeld/beellama.cpp/blob/main/docs/beellama-args.md).\n\nTurboQuant (WHT-based scalar quantization) originates from [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant). TCQ (Trellis-Coded Quantization) and basic DFlash implementation originate from [spiritbuun/buun-llama-cpp](https://github.com/spiritbuun/buun-llama-cpp) (paper: [Closing the Gap: Trellis-Coded Quantization for KV Cache at 2-3 Bits](https://huggingface.co/datasets/spiritbuun/turboquant-tcq-kv-cache)).",
+      "author_fullname": "t2_p18sma",
+      "saved": false,
+      "mod_reason_title": null,
+      "gilded": 0,
+      "clicked": false,
+      "title": "BeeLlama.cpp: advanced DFlash &amp; TurboQuant with support of reasoning and vision. Qwen 3.6 27B Q5 with 200k context on 3090, 2-3x faster than baseline (peak 135 tps!)",
+      "link_flair_richtext": [
+        {
+          "e": "text",
+          "t": "Resources"
+        }
+      ],
+      "subreddit_name_prefixed": "r/LocalLLaMA",
+      "hidden": false,
+      "pwls": 6,
+      "link_flair_css_class": "",
+      "downs": 0,
+      "thumbnail_height": 70,
+      "top_awarded_type": null,
+      "hide_score": false,
+      "media_metadata": {
+        "lqjgiw1bx40h1": {
+          "status": "valid",
+          "e": "Image",
+          "m": "image/jpg",
+          "p": [
+            {
+              "y": 36,
+              "x": 108,
+              "u": "https://preview.redd.it/lqjgiw1bx40h1.jpg?width=108&amp;crop=smart&amp;auto=webp&amp;s=6557733fd9261d3c605c4c2539e2d97af208041c"
+            },
+            {
+              "y": 72,
+              "x": 216,
+              "u": "https://preview.redd.it/lqjgiw1bx40h1.jpg?width=216&amp;crop=smart&amp;auto=webp&amp;s=fa38cbec4145ad987f02cccad1a6459a03fee22f"
+            },
+            {
+              "y": 106,
+              "x": 320,
+              "u": "https://preview.redd.it/lqjgiw1bx40h1.jpg?width=320&amp;crop=smart&amp;auto=webp&amp;s=1a09071c5ab7020f0cff4a2054ba917e2f75ffa2"
+            },
+            {
+              "y": 213,
+              "x": 640,
+              "u": "https://preview.redd.it/lqjgiw1bx40h1.jpg?width=640&amp;crop=smart&amp;auto=webp&amp;s=679711f42363a3d7385d7830ae19666d8f6b1f27"
+            },
+            {
+              "y": 320,
+              "x": 960,
+              "u": "https://preview.redd.it/lqjgiw1bx40h1.jpg?width=960&amp;crop=smart&amp;auto=webp&amp;s=bd5edf10ec48e54f02c660ac51ddfa1aaace3eb9"
+            },
+            {
+              "y": 360,
+              "x": 1080,
+              "u": "https://preview.redd.it/lqjgiw1bx40h1.jpg?width=1080&amp;crop=smart&amp;auto=webp&amp;s=4d35f038dd9b263e7605279d648f83fc1fa05438"
+            }
+          ],
+          "s": {
+            "y": 600,
+            "x": 1800,
+            "u": "https://preview.redd.it/lqjgiw1bx40h1.jpg?width=1800&amp;format=pjpg&amp;auto=webp&amp;s=3b68c16e78d36a1089a14f31b338aa78b8a1c073"
+          },
+          "id": "lqjgiw1bx40h1"
+        }
+      },
+      "name": "t3_1t88zvv",
+      "quarantine": false,
+      "link_flair_text_color": "light",
+      "upvote_ratio": 0.93,
+      "author_flair_background_color": null,
+      "subreddit_type": "public",
+      "ups": 322,
+      "total_awards_received": 0,
+      "media_embed": {},
+      "thumbnail_width": 140,
+      "author_flair_template_id": null,
+      "is_original_content": false,
+      "user_reports": [],
+      "secure_media": null,
+      "is_reddit_media_domain": false,
+      "is_meta": false,
+      "category": null,
+      "secure_media_embed": {},
+      "link_flair_text": "Resources",
+      "can_mod_post": false,
+      "score": 322,
+      "approved_by": null,
+      "is_created_from_ads_ui": false,
+      "author_premium": false,
+      "thumbnail": "https://external-preview.redd.it/t3DTJ8K2TE17BAIjuHqbfP3ERS-kc9mK_NReW9wVrps.png?width=140&amp;height=70&amp;auto=webp&amp;s=e1e30da26a19da15d08cd0427314e5a0caa96968",
+      "edited": 1778343406.0,
+      "author_flair_css_class": null,
+      "author_flair_richtext": [],
+      "gildings": {},
+      "content_categories": null,
+      "is_self": true,
+      "mod_note": null,
+      "created": 1778342705.0,
+      "link_flair_type": "richtext",
+      "wls": 6,
+      "removed_by_category": null,
+      "banned_by": null,
+      "author_flair_type": "text",
+      "domain": "self.LocalLLaMA",
+      "allow_live_comments": false,
+      "selftext_html": "&lt;!-- SC_OFF --&gt;&lt;div class=\"md\"&gt;&lt;p&gt;TL;DR New llama.cpp fork! I wanted a Windows-friendly inference to run Qwen 3.6 27B &lt;strong&gt;Q5&lt;/strong&gt; on a single RTX 3090 with speculative decoding, high context without excess quantization, and vision enabled. No option did this out of the box for me without VRAM and/or tooling issues (this was before MTP PR for llama.cpp surfaced there).&lt;/p&gt;\n\n&lt;p&gt;So I pulled out an old trick: stay up to 4 a.m. one too many times to do month+ work in a week or two. I probably lost a decent amount of hair while trying to make this all work, but now I have what seems to be a proper solution and don&amp;#39;t mind to share.&lt;/p&gt;\n\n&lt;h1&gt;Anbeeld&amp;#39;s BeeLlama.cpp&lt;/h1&gt;\n\n&lt;p&gt;&lt;a href=\"https://preview.redd.it/lqjgiw1bx40h1.jpg?width=1800&amp;amp;format=pjpg&amp;amp;auto=webp&amp;amp;s=3b68c16e78d36a1089a14f31b338aa78b8a1c073\"&gt;https://preview.redd.it/lqjgiw1bx40h1.jpg?width=1800&amp;amp;format=pjpg&amp;amp;auto=webp&amp;amp;s=3b68c16e78d36a1089a14f31b338aa78b8a1c073&lt;/a&gt;&lt;/p&gt;\n\n&lt;p&gt;&lt;strong&gt;GitHub repo:&lt;/strong&gt; &lt;a href=\"https://github.com/Anbeeld/beellama.cpp\"&gt;&lt;strong&gt;https://github.com/Anbeeld/beellama.cpp&lt;/strong&gt;&lt;/a&gt;&lt;/p&gt;\n\n&lt;p&gt;BeeLlama.cpp (or just Bee) is a performance-focused llama.cpp fork for squeezing more speed and context out of local GGUF inference. It keeps the familiar llama.cpp tools and server flow, then adds DFlash speculative decoding, adaptive draft control, TurboQuant/TCQ KV-cache compression, and reasoning-loop protection, with full multimodal support.&lt;/p&gt;\n\n&lt;blockquote&gt;\n&lt;p&gt;Not quite a pegasus, but close enough.&lt;/p&gt;\n&lt;/blockquote&gt;\n\n&lt;p&gt;Here&amp;#39;s a &lt;a href=\"https://github.com/Anbeeld/beellama.cpp/blob/main/docs/quickstart-qwen36-dflash.md\"&gt;plug-and-play Qwen 3.6 27B setup&lt;/a&gt; with a config to run it in Q5 + 200k of practically lossless KV cache + vision on a single RTX 3090 or 4090.&lt;/p&gt;\n\n&lt;h1&gt;Fork Features&lt;/h1&gt;\n\n&lt;ul&gt;\n&lt;li&gt;&lt;strong&gt;DFlash speculative decoding&lt;/strong&gt;: &lt;code&gt;--spec-type dflash&lt;/code&gt; drives a DFlash draft GGUF alongside the target model. The target captures hidden states into a per-layer 4096-slot ring buffer, the drafter cross-attends to the most recent &lt;code&gt;--spec-dflash-cross-ctx&lt;/code&gt; hidden-state tokens and proposes drafts for target verification.&lt;/li&gt;\n&lt;li&gt;&lt;strong&gt;TurboQuant / TCQ KV-cache compression&lt;/strong&gt;: Five cache types (&lt;code&gt;turbo2&lt;/code&gt;, &lt;code&gt;turbo3&lt;/code&gt;, &lt;code&gt;turbo4&lt;/code&gt;, &lt;code&gt;turbo2_tcq&lt;/code&gt;, &lt;code&gt;turbo3_tcq&lt;/code&gt;) spanning from 4x to 7.5x compression, with higher-bit options being practically lossless in many cases. Set independently with &lt;code&gt;--cache-type-k&lt;/code&gt; and &lt;code&gt;--cache-type-v&lt;/code&gt;.&lt;/li&gt;\n&lt;li&gt;&lt;strong&gt;Adaptive draft-max control&lt;/strong&gt;: The server adjusts the active draft horizon at runtime instead of using a fixed &lt;code&gt;--spec-draft-n-max&lt;/code&gt;. The default &lt;code&gt;profit&lt;/code&gt; controller compares speculative throughput against a no-spec baseline; the &lt;code&gt;fringe&lt;/code&gt; alternative maps acceptance-rate bands to draft depth.&lt;/li&gt;\n&lt;li&gt;&lt;strong&gt;Full multimodal support&lt;/strong&gt;: When &lt;code&gt;--mmproj&lt;/code&gt; is active, the server keeps flat DFlash available for text generation. The model can be fully offloaded to CPU with no problems to reduce VRAM pressure.&lt;/li&gt;\n&lt;li&gt;&lt;strong&gt;Reasoning-loop protection&lt;/strong&gt;: The server detects repeated hidden reasoning output and intervenes. Default mode is &lt;code&gt;force-close&lt;/code&gt; with &lt;code&gt;--reasoning-loop-window&lt;/code&gt; and &lt;code&gt;--reasoning-loop-max-period&lt;/code&gt; tuning available.&lt;/li&gt;\n&lt;li&gt;&lt;strong&gt;Sampled DFlash verification&lt;/strong&gt;: &lt;code&gt;--spec-draft-temp&lt;/code&gt; enables rejection-sampling drafter behavior. Activates when both draft and target temperature exceed zero. Draft log probabilities must be available for rejection sampling to produce correct output.&lt;/li&gt;\n&lt;li&gt;&lt;strong&gt;DDTree branch verification&lt;/strong&gt;: optional &lt;code&gt;--spec-branch-budget&lt;/code&gt; adds branch nodes beyond the main draft path with GPU &lt;code&gt;parent_ids&lt;/code&gt;, tree masks, and recurrent tree kernels. Disabled automatically when the target model spans more than one GPU. This one is very much work in progress!&lt;/li&gt;\n&lt;li&gt;&lt;strong&gt;Request-level speculative overrides&lt;/strong&gt;: Draft-max and branch budget can be overridden per-request through JSON fields without restarting the server.&lt;/li&gt;\n&lt;li&gt;&lt;strong&gt;CopySpec model-free speculation&lt;/strong&gt;: &lt;code&gt;--spec-type copyspec&lt;/code&gt; provides rolling-hash suffix matching over previous tokens without a draft model.&lt;/li&gt;\n&lt;/ul&gt;\n\n&lt;p&gt;For the full feature and public-repo comparison, read &lt;a href=\"https://github.com/Anbeeld/beellama.cpp/blob/main/docs/beellama-features.md\"&gt;docs/beellama-features.md&lt;/a&gt;. For the complete argument reference, read &lt;a href=\"https://github.com/Anbeeld/beellama.cpp/blob/main/docs/beellama-args.md\"&gt;docs/beellama-args.md&lt;/a&gt;.&lt;/p&gt;\n\n&lt;p&gt;TurboQuant (WHT-based scalar quantization) originates from &lt;a href=\"https://github.com/TheTom/llama-cpp-turboquant\"&gt;TheTom/llama-cpp-turboquant&lt;/a&gt;. TCQ (Trellis-Coded Quantization) and basic DFlash implementation originate from &lt;a href=\"https://github.com/spiritbuun/buun-llama-cpp\"&gt;spiritbuun/buun-llama-cpp&lt;/a&gt; (paper: &lt;a href=\"https://huggingface.co/datasets/spiritbuun/turboquant-tcq-kv-cache\"&gt;Closing the Gap: Trellis-Coded Quantization for KV Cache at 2-3 Bits&lt;/a&gt;).&lt;/p&gt;\n&lt;/div&gt;&lt;!-- SC_ON --&gt;",
+      "likes": null,
+      "suggested_sort": null,
+      "banned_at_utc": null,
+      "view_count": null,
+      "archived": false,
+      "no_follow": false,
+      "is_crosspostable": false,
+      "pinned": false,
+      "over_18": false,
+      "all_awardings": [],
+      "awarders": [],
+      "media_only": false,
+      "link_flair_template_id": "ab9120c4-bf8e-11ed-ae5e-2eb8b7c7e10b",
+      "can_gild": false,
+      "spoiler": false,
+      "locked": false,
+      "author_flair_text": null,
+      "treatment_tags": [],
+      "visited": false,
+      "removed_by": null,
+      "num_reports": null,
+      "distinguished": null,
+      "subreddit_id": "t5_81eyvm",
+      "author_is_blocked": false,
+      "mod_reason_by": null,
+      "removal_reason": null,
+      "link_flair_background_color": "#ccac2b",
+      "id": "1t88zvv",
+      "is_robot_indexable": true,
+      "report_reasons": null,
+      "author": "Anbeeld",
+      "discussion_type": null,
+      "num_comments": 203,
+      "send_replies": true,
+      "contest_mode": false,
+      "mod_reports": [],
+      "author_patreon_flair": false,
+      "author_flair_text_color": null,
+      "permalink": "/r/LocalLLaMA/comments/1t88zvv/beellamacpp_advanced_dflash_turboquant_with/",
+      "stickied": false,
+      "url": "https://www.reddit.com/r/LocalLLaMA/comments/1t88zvv/beellamacpp_advanced_dflash_turboquant_with/",
+      "subreddit_subscribers": 742102,
+      "created_utc": 1778342705.0,
+      "num_crossposts": 0,
+      "media": null,
+      "is_video": false
+    }
+  }
+]

@@ -14,5 +14,10 @@ llama.cpp-b9360-cuda12/
 # Runtime error logs
 *.err.log
 
+# Reddit API credentials — NEVER commit
+reddit.txt
+.reddit_token.json
+.gitignore_for_token
+
 # OMC session state (not project content)
-.omc/.reddit_token.json
+.omc/
