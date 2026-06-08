@@ -14,8 +14,10 @@ llama.cpp-b9360-cuda12/
 # Runtime error logs
 *.err.log
 
-# Benchmark results (machine-specific, regenerate locally)
-benchmark_results/
+# Benchmark JSON results (machine-specific, regenerate locally)
+benchmark_results/*.json
+
+# Benchmark summaries are tracked (not ignored)
 
 # Reddit API credentials — NEVER commit
 reddit.txt
