@@ -1,6 +1,8 @@
 ## Configuration Gap Analysis & Fix Guide
 
-Based on r/LocalLLaMA research, the biggest performance gap is the **runtime**. Switching from upstream llama.cpp to ik_llama.cpp with `--n-cpu-moe` takes Q4_K_M from 16/22 score + 26 tok/s to 22/22 score + **61 tok/s** on identical hardware (RTX 5060 Ti 16GB + DDR4).
+Based on r/LocalLLaMA research, the biggest performance gap is the **runtime**. Switching from upstream llama.cpp to ik_llama.cpp with `--n-cpu-moe` is reported to take Q4_K_M from 16/22 score + 26 tok/s to 22/22 score + **61 tok/s** on identical hardware (RTX 5060 Ti 16GB + DDR4).
+
+> **WARNING — Windows Performance Unknown:** All verified high-speed benchmarks (110 tok/s, 72.9 tok/s, 80 tok/s) are on **Linux** (CachyOS, Ubuntu). Two Reddit users report disappointing ik_llama.cpp performance on Windows. The 61/74.7 tok/s bobaburger claims are **unverified** — no source post found, likely DDR5 + Linux. **Benchmark on our Windows setup before relying on these numbers.** See [REDDIT_SYNTHESIS.md](REDDIT_SYNTHESIS.md#windows-warning) for full evidence.
 
 ---
 
@@ -8,13 +10,13 @@ Based on r/LocalLLaMA research, the biggest performance gap is the **runtime**. 
 
 | Gap | Current | Fix | Expected impact |
 |-----|---------|-----|-----------------|
-| Runtime | llama.cpp b9360 | ik_llama.cpp (built from source) | **+135% tok/s** (26→61 proven on same hardware) |
+| Runtime | llama.cpp b9360 | ik_llama.cpp (built from source) | **+135% tok/s** (26→61 reported on same hardware, **UNVERIFIED on Windows**) |
 | MoE offload | `--fit` auto only | `--n-cpu-moe 16` + `-fmoe` (ik_llama.cpp) | Better MoE CPU/GPU split, fused ops |
-| MTP (27B dense) | None ("MTP hurts -42%") | `--spec-type mtp:n_max=1,p_min=0.0` (ik_llama.cpp) | +27-30% with ik_llama.cpp MTP (dense now supported) |
+| MTP (27B dense) | None ("MTP hurts -42%") | `--spec-type mtp:n_max=1,p_min=0.0` (ik_llama.cpp) | +27-150% with ik_llama.cpp MTP (range depends on hardware; 27% on 2x RTX 3090, 150% on Mac M2 Max) |
 | MTP (35B MoE) | `--spec-type draft-mtp` (legacy) | `--spec-type mtp:n_max=1,p_min=0.0` (ik_llama.cpp canonical) | Better accept rate with canonical flag |
 | Sampling params | None in 27B script | temp=0.6, top-p=0.95, top-k=20, min-p=0, presence-penalty=1.25 | Better output quality |
 | KV cache (27B) | q4_0 | q4_0 is fine, but ik_llama.cpp has Q8_KV option | Same or slightly better |
-| Batch flags | None on 27B, fixed 2048 on MoE | Remove `-b`/`-ub` when using `--fit` | bobaburger: 74.7 tok/s without batch flags |
+| Batch flags | None on 27B, fixed 2048 on MoE | Remove `-b`/`-ub` when using `--fit` | bobaburger: 74.7 tok/s without batch flags (**UNVERIFIED**) |
 | llama.cpp version | b9360 (stale) | b9484+ or ik_llama.cpp | Better MoE offload handling |
 | `-rtr` flag | Not used (good) | **Never add `-rtr`** with hybrid CPU/GPU MoE | Prevents GPU offload of CPU tensors |
 | `_XL` GGUF | Not used (good) | **Never use Unsloth `_XL` GGUF** with ik_llama.cpp | f16 tensors break ik_llama.cpp |
@@ -61,6 +63,33 @@ cmake --build build --config Release
 
 **Note**: If `120-real` doesn't work for Blackwell, try `120` or `89-real` (Ampere fallback). Check your GPU compute capability with `nvidia-smi --query-gpu=compute_cap --format=csv`.
 
+#### Pre-built Windows binaries (skip building from source)
+
+If you don't want to build from source, pre-built Windows binaries exist:
+
+| Source | Link | Notes |
+|--------|------|-------|
+| Thireus releases | https://github.com/Thireus/ik_llama.cpp/releases | macOS, Ubuntu, Windows |
+| X5R HuggingFace | https://huggingface.co/X5R/ik_llama.cpp | Pre-built Windows binary |
+| Danmoreng build script | See [Reddit thread](https://reddit.com/r/LocalLLaMA/comments/1mga3ox/) | PowerShell all-in-one |
+
+**Caveat**: Pre-built binaries may not include the latest MTP fixes. Check release dates against PR #1698 merge date.
+
+#### IQ4_KS — The 16GB VRAM Sweet Spot (27B dense)
+
+From [Pablo_the_brave, 81pts on Reddit](https://reddit.com/r/LocalLLaMA/comments/1tkmgwj/):
+- **IQ4_KS** (14.1GB) fits entirely in 16GB VRAM with room for 105K context
+- Requires ik_llama.cpp (KS/KSS quants not in upstream llama.cpp)
+- **1.5-1.75x faster** than IQ4_XS with comparable quality (PPL 7.4040)
+- With q4_0 Hadamard KV cache (`-khad -vhad -ctk q4_0 -ctv q4_0`)
+- Eliminates "blank outputs" issue seen with some quants
+- Model: `cHunter789/Qwen3.6-27B-i1-IQ4_KS-GGUF`
+
+```powershell
+# Download IQ4_KS model
+hf download cHunter789/Qwen3.6-27B-i1-IQ4_KS-GGUF Qwen3.6-27B.i1-IQ4_KS.gguf --local-dir models\Qwen3.6-27B-IQ4_KS
+```
+
 #### ik_llama.cpp key flags
 
 | Flag | Purpose | Notes |
@@ -82,10 +111,12 @@ cmake --build build --config Release
 
 **CRITICAL**: Do NOT use Unsloth `_XL` GGUF models with ik_llama.cpp — they contain f16 tensors which don't work.
 
-#### Proven config for 35B MoE on RTX 5060 Ti 16GB + DDR4 (bobaburger)
+#### Proven config for 35B MoE on RTX 5060 Ti 16GB + DDR4 (bobaburger — **UNVERIFIED**)
+
+> **Note**: The 61 tok/s and 74.7 tok/s bobaburger numbers are **unverified**. No Reddit post from "bobaburger" found in our evidence collection. These numbers likely reflect DDR5 + Linux, not our DDR4 + Windows setup. Two Reddit users report disappointing ik_llama.cpp performance on Windows. **Benchmark on our hardware before relying on these claims.**
 
 ```powershell
-# ik_llama.cpp server with n-cpu-moe (61 tok/s proven on same hardware)
+# ik_llama.cpp server with n-cpu-moe (61 tok/s reported, UNVERIFIED on Windows)
 ik_llama-server.exe ^
   -m Qwen3.6-35B-A3B-UD-Q4_K_M.gguf ^
   --host 127.0.0.1 --port 8080 ^
@@ -228,30 +259,33 @@ No major speed fix possible without switching to ik_llama.cpp. The 27B config is
 | q8_0 KV | Keep | Best for 35B MoE hybrid |
 | `--cache-ram 0` | Keep | Prevents DDR4 speed collapse |
 
-**The biggest single fix**: switch to ik_llama.cpp with `--n-cpu-moe 16`. This alone takes 26→61 tok/s on same hardware.
+**The biggest single fix**: switch to ik_llama.cpp with `--n-cpu-moe 16`. This alone reportedly takes 26→61 tok/s on same hardware (**UNVERIFIED on Windows**).
 
 ---
 
 ### Recommended benchmark order
 
 1. **Baseline retest**: Run current configs with benchmark_qwen_mtp.py to establish fresh baselines
-2. **ik_llama.cpp 35B MoE**: Build ik_llama.cpp, run with `--n-cpu-moe 16 -fmoe`, benchmark
-3. **ik_llama.cpp 35B MoE + fit**: Run with `--fit` (no n-cpu-moe), compare against n-cpu-moe
-4. **ik_llama.cpp 27B dense**: Run with same flags as current, compare baseline
-5. **ik_llama.cpp 27B dense + MTP**: Download MTP GGUF, run with `--spec-type mtp:n_max=1,p_min=0.0`, benchmark
-6. **TurboQuant 35B MoE**: If interested, build atomic fork, benchmark with turbo3 KV + NextN
+2. **ik_llama.cpp Windows validation**: Download pre-built binary (Thireus or X5R), test 27B IQ3_XXS with same flags — compare against llama.cpp baseline. **This is the critical gate: if ik_llama.cpp is not faster on Windows, stop here and use upstream.**
+3. **ik_llama.cpp 27B + IQ4_KS**: If step 2 passes, download IQ4_KS model (14.1GB), benchmark — should be 1.5-1.75x faster than IQ4_XS
+4. **ik_llama.cpp 27B + MTP**: Download MTP GGUF, run with `--spec-type mtp:n_max=1,p_min=0.0`, benchmark
+5. **ik_llama.cpp 35B MoE**: Run with `--n-cpu-moe 16 -fmoe`, benchmark
+6. **ik_llama.cpp 35B MoE + fit**: Run with `--fit` (no n-cpu-moe), compare against n-cpu-moe
+7. **TurboQuant 35B MoE**: If interested, build atomic fork, benchmark with turbo3 KV + NextN
 
 ---
 
-### Reference: proven results on same hardware (RTX 5060 Ti 16GB + DDR4)
+### Reference: results on RTX 5060 Ti 16GB hardware
 
-| Config | Runtime | Score | Speed | Source |
-|--------|---------|-------|-------|--------|
-| Q4_K_M + fit auto | llama.cpp | 16/22 | 26 tok/s | Our current |
-| Q4_K_M + n-cpu-moe 16 | ik_llama.cpp | 22/22 | **61 tok/s** | bobaburger (Reddit) |
-| Q4_K_M + fit (no batch flags) | ik_llama.cpp | — | **74.7 tok/s** | bobaburger (Reddit) |
-| IQ3_S (fits entirely in VRAM) | llama.cpp | — | 98 tok/s | njannasch.dev (Linux) |
-| IQ3_S + MTP (fits VRAM) | llama.cpp | — | 144 tok/s | njannasch.dev (Linux) |
+| Config | Runtime | Score | Speed | Source | OS |
+|--------|---------|-------|-------|--------|----|
+| Q4_K_M + fit auto | llama.cpp | 16/22 | 26 tok/s | Our current | Windows |
+| Q4_K_M + n-cpu-moe 16 | ik_llama.cpp | 22/22 | **61 tok/s** | bobaburger (**UNVERIFIED**) | Unknown (likely Linux) |
+| Q4_K_M + fit (no batch flags) | ik_llama.cpp | — | **74.7 tok/s** | bobaburger (**UNVERIFIED**) | Unknown (likely Linux) |
+| IQ3_S (fits entirely in VRAM) | llama.cpp | — | 98 tok/s | njannasch.dev | Linux |
+| IQ3_S + MTP (fits VRAM) | llama.cpp | — | 144 tok/s | njannasch.dev | Linux |
+
+**Key insight**: All top benchmarks are on Linux + DDR5. Zero verified Windows benchmarks exist. DDR4 + Windows will likely be slower.
 
 ---
 
@@ -264,6 +298,9 @@ hf download unsloth/Qwen3.6-35B-A3B-MTP-GGUF Qwen3.6-35B-A3B-UD-Q4_K_S.gguf --lo
 
 # New models needed for ik_llama.cpp MTP
 hf download Radamanthys11/Qwen3.6-27B-MTP-Q8_0-GGUF Qwen3.6-27B-MTP-Q8_0.gguf --local-dir models\Qwen3.6-27B-MTP-GGUF
+
+# IQ4_KS for 27B — 16GB VRAM sweet spot (ik_llama.cpp only)
+hf download cHunter789/Qwen3.6-27B-i1-IQ4_KS-GGUF Qwen3.6-27B.i1-IQ4_KS.gguf --local-dir models\Qwen3.6-27B-IQ4_KS
 
 # New models needed for TurboQuant
 hf download AtomicChat/Qwen3.6-35B-A3B-UDT-MTP-GGUF Qwen3.6-35B-A3B-UDT-MTP-TQ4_1S.gguf --local-dir models\TurboQuant
