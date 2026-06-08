@@ -1,6 +1,6 @@
 ## Configuration Guide — Qwen 3.6 on RTX 5060 Ti 16GB + DDR4 + Windows 11
 
-**Last updated**: 2026-06-08 — added 27B long-context config, q8_0 vs q4_0 KV benchmarks
+**Last updated**: 2026-06-08 — added chat template fix, 32K context for opencode, MTP draft-max tuning
 
 ---
 
@@ -10,10 +10,10 @@
 |-------|--------|-------|---------|---------|----------|
 | 35B MoE Q4_K_S | `start-server-35b.ps1` | **53.56 t/s avg** (57 t/s multi-turn) | 64k | 5/5 tasks | Best overall |
 | 35B MoE Q4_K_S (no MTP) | `start-server-35b-reddit60.ps1` | **46.03 t/s avg** | 64k | 5/5 tasks | Baseline comparison |
-| 27B Dense IQ3_M + MTP | `start-server-27b.ps1` | **~28 t/s** short, **15-23 t/s** opencode | 64k | 4/4 tasks | opencode/coding agent |
+| 27B Dense IQ3_M + MTP | `start-server-27b.ps1` | **~28 t/s** short, **~30 t/s** opencode | 32k | 4/4 tasks | opencode/coding agent |
 | 27B Dense IQ3_XXS (raw API) | `start-server-27b-longctx.ps1` | **~26 t/s** stable to 15K | 16k | 4/4 tasks | Raw API long context |
 
-*27B MTP with 64K ctx is best for opencode — client-side context management keeps active context manageable.
+*27B MTP with 32K ctx is best for opencode — opencode auto-compacts at ~10-15K anyway, so 64K KV reservation is wasted VRAM.
 Use longctx variant only for raw API use where you send full accumulated context.
 
 **Recommendation**: For opencode, use `start-server-27b.ps1`. For raw API, use `start-server-35b.ps1`.
@@ -109,9 +109,13 @@ See `benchmark_results/35B_LESSONS_LEARNED.md` for the full list. Key mistakes:
 1. **Missing `--fit on`** — caused ~30 t/s instead of ~46 t/s (53% loss from one flag)
 2. **`--no-mmap`** — hurt MoE expert paging
 3. **`--cache-ram 0`** — disabled prompt caching unnecessarily
-4. **Wrong speed measurement** — `completion_tokens / total_elapsed` includes prompt time, understates generation by ~40%. Use `timings.predicted_per_second`
+4. **Wrong speed measurement** — `completion_tokens / total_elapsed` includes prompt time, understates generation by ~40%. Use `timelines.predicted_per_second`
 5. **"DDR4 ceiling at ~30 t/s"** — wrong conclusion from broken config. Real ceiling is ~45-50 t/s sustained
 6. **"MTP doesn't help on DDR4"** — wrong. MTP gives +16% on correct base config
+7. **Missing chat template** — MTP gguf (froggeric) has no embedded chat_template. Without `--chat-template-file`, the model outputs XML-style `<function=...>` tool calls instead of OpenAI JSON `tool_calls`. This completely broke opencode tool usage. Fix: `--chat-template-file models\Qwen3.6-27B-MTP-GGUF\templates\chat_template.jinja`
+8. **64K context for opencode is wasteful** — opencode auto-compacts at ~10-15K tokens. 64K context reserves ~4.6GB KV VRAM that's never used, pushing model layers to CPU/DDR4. 32K context reserves ~2.3GB KV, model stays on GPU, generation goes from ~15 t/s to ~30 t/s
+9. **draft-max=3 breaks tool call JSON** — With draft-max=3, MTP speculates 3 tokens ahead. If any draft token in the middle of a JSON tool call is rejected, the output structure breaks. draft-max=1 is safer for structured output with minimal speed loss (~30 t/s vs ~28 t/s with draft-max=3 at 32K ctx)
+10. **Context limit mismatch causes compaction storms** — If opencode config says 64K but server only has 16K (longctx running), every request over 16K fails, triggers compaction, retries. Result: 7 compactions in 29 min, each wasting 20-77 seconds. Match the opencode context limit to the actual server `-c` value
 
 ---
 
@@ -136,7 +140,9 @@ Based on Anbeeld benchmarks + our own generation testing:
 | ik_llama.cpp (any build) | 2 t/s or crash | AVX2 build is 10x slower than upstream. AVX512 crashes on Raptor Lake (partial AVX512) |
 | Lower KV quant for MoE generation | Slower | Decompression overhead > VRAM savings |
 | iq4_nl KV cache (27B dense) | 8 t/s at 5K | Massive decompression overhead, worse than q4_0 and q8_0 |
-| 32k context for speed | ~54 t/s but useless | Can't handle long sessions. 64k for 35B, 16k for 27B is the right tradeoff |
+| 64K context for 27B in opencode | ~15 t/s, constant compaction | Wasted KV reservation pushes layers to CPU. opencode compacts at ~10-15K anyway |
+| MTP without chat template | Tool calls broken | Model outputs XML `<function=...>` instead of JSON `tool_calls` |
+| draft-max=3 with tool calls | JSON corruption | Rejected speculative tokens break structured output mid-generation |
 
 ---
 
@@ -147,8 +153,8 @@ Based on Anbeeld benchmarks + our own generation testing:
 | DDR5 RAM | ~30→50+ t/s MoE offload bandwidth | Hardware upgrade |
 | Linux dual-boot | Unlocks ik_llama.cpp (61+ t/s proven) | OS change |
 | Newer llama.cpp build (b9484+) | Possible incremental MoE gains | Easy to test |
-| draft-max=1 vs 2 | Possibly higher acceptance rate | Easy to test |
 | Smaller 35B quant (IQ4_XS ~16GB) | More VRAM fit, less offload | Need model file |
+| Chat template in gguf metadata | Eliminates need for --chat-template-file flag | Repack model file |
 
 ---
 
@@ -162,13 +168,25 @@ This is Reddit consensus for Qwen 3.6 quality. Our benchmark scripts include the
 
 ---
 
+### Critical Flags for opencode (27B MTP)
+
+These three flags are required for opencode to work correctly with the 27B MTP model. Without any one of them, tool calls break or speed collapses:
+
+| Flag | What it does | What breaks without it |
+|------|-------------|----------------------|
+| `--chat-template-file ...chat_template.jinja` | Enables JSON tool_calls format | Model outputs XML `<function=...>` — opencode can't parse tool calls |
+| `-c 32000` (not 64000) | Smaller KV reservation, more VRAM for model layers | 64K reserves 4.6GB KV (wasted), layers go to CPU, ~15 t/s instead of ~30 t/s |
+| `-rea off` | Disables thinking mode | Qwen 3.6 thinking returns empty `content` field — opencode sees empty response |
+
+---
+
 ### File Reference
 
 | File | Purpose |
 |------|---------|
 | `start-server-35b.ps1` | 35B MoE production (MTP + ngram, 64k ctx) |
 | `start-server-35b-reddit60.ps1` | 35B baseline (no MTP, for comparison) |
-| `start-server-27b.ps1` | 27B dense short-context (MTP, 35 t/s at <1K ctx) |
+| `start-server-27b.ps1` | 27B dense opencode (MTP, 32K ctx, chat template, ~30 t/s) |
 | `start-server-27b-longctx.ps1` | 27B dense long-context (no MTP, ~25 t/s at 20K) |
 | `stop-server.ps1` | Kill running server |
 | `benchmark-35b.py` | 35B benchmark (5 tasks, proper speed measurement) |
@@ -184,6 +202,11 @@ This is Reddit consensus for Qwen 3.6 quality. Our benchmark scripts include the
 # 35B MoE (production)
 hf download unsloth/Qwen3.6-35B-A3B-MTP-GGUF Qwen3.6-35B-A3B-UD-Q4_K_S.gguf --local-dir models\Qwen3.6-35B-A3B-MTP-GGUF
 
-# 27B Dense (production)
+# 27B Dense MTP (for opencode — includes chat template)
+hf download froggeric/Qwen3.6-27B-MTP-GGUF Qwen3.6-27B-IQ3_M-mtp.gguf --local-dir models\Qwen3.6-27B-MTP-GGUF
+# Chat template (REQUIRED — not embedded in gguf):
+# Already in models\Qwen3.6-27B-MTP-GGUF\templates\chat_template.jinja
+
+# 27B Dense LongCtx (for raw API)
 hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-UD-IQ3_XXS.gguf --local-dir models\Qwen3.6-27B-GGUF
 ```
