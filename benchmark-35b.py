@@ -227,9 +227,14 @@ def call_model(prompt: str) -> dict:
     usage = parsed.get("usage", {})
     completion_tokens = usage.get("completion_tokens")
     prompt_tokens = usage.get("prompt_tokens")
-    tps = None
-    if completion_tokens and elapsed > 0:
-        tps = completion_tokens / elapsed
+
+    # Use server-reported generation speed (predicted_per_second) when available.
+    # Fallback to completion_tokens/elapsed includes prompt processing time
+    # and understates true generation speed.
+    timings = parsed.get("timings", {})
+    tps_server = timings.get("predicted_per_second")
+    tps_naive = completion_tokens / elapsed if completion_tokens and elapsed > 0 else None
+    tps = tps_server if tps_server else tps_naive
 
     return {
         "raw": parsed,
@@ -237,7 +242,8 @@ def call_model(prompt: str) -> dict:
         "elapsed_sec": elapsed,
         "completion_tokens": completion_tokens,
         "prompt_tokens": prompt_tokens,
-        "tokens_per_sec": tps,
+        "tokens_per_sec": round(tps, 2) if tps else None,
+        "tokens_per_sec_naive": round(tps_naive, 2) if tps_naive else None,
     }
 
 

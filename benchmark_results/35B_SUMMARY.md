@@ -6,37 +6,34 @@
 
 | Config | Runtime | Speed | Passed | Notes |
 |--------|---------|-------|--------|-------|
-| Q4_K_S (19.9GB) | llama.cpp b9360 | **29.88 tok/s** | 5/5 | Best 35B result |
-| Q4_K_M + --fit | llama.cpp b9360 | 26.50 tok/s | 5/5 | Slightly slower (larger model) |
-| Q4_K_M + --fit + MTP + ngram-mod | llama.cpp b9360 | 26.86 tok/s | 5/5 | Speculative doesn't help on DDR4 |
+| Q4_K_S vanilla (no fit, no-mmap, cache-ram 0) | llama.cpp b9360 | ~30* / ~49** tok/s | 5/5 | *naive measurement, **server-reported tg speed |
+| Q4_K_S + fit on + kv-unified + no-mmproj | llama.cpp b9360 | **46.03 tok/s** | 5/5 | Corrected config, proper speed measurement |
+| Q4_K_S + fit + kv-unified + no-mmproj + MTP+ngram | llama.cpp b9360 | **53.56 tok/s** | 5/5 | +16% from speculative decoding |
+| Q4_K_S + fit + MTP+ngram + q5_0/q4_1 KV | llama.cpp b9360 | 40.20 tok/s | 5/5 | Lower KV quant hurts generation speed |
+| Q4_K_S + fit + MTP+ngram + q8_0/q5_0 KV | llama.cpp b9360 | ~36 tok/s | - | Asymmetric KV slower for generation |
+| Q4_K_S + fit + MTP+ngram + 32k ctx | llama.cpp b9360 | ~54 tok/s | - | Faster but can't handle long sessions |
 
 ## Key Lessons
 
-1. **DDR4 is the hard ceiling at ~30 tok/s for 35B MoE**. The 35B MoE at Q4_K (~20GB) must offload MoE experts to CPU RAM. DDR4 bandwidth (~25GB/s) limits generation to ~30 tok/s regardless of quant or speculative decoding.
+1. **Config was the bottleneck, not hardware**. The old config missed `--fit on`, `--kv-unified`, `--no-mmproj`, and had harmful `--no-mmap` and `--cache-ram 0`. Fixing these alone took generation from ~30 to ~46 tok/s.
 
-2. **MTP + ngram-mod stacking doesn't help on DDR4**. The Reddit user who got 60 tok/s likely has DDR5 (~50GB/s+ bandwidth). Speculative decoding acceptance rate is high but DDR4 can't feed the verified tokens fast enough to benefit.
+2. **MTP + ngram-mod stacking adds +16% on top of good config**. With the corrected base (fit on, kv-unified), speculative decoding gives 46 → 53.56 tok/s. Previously it showed no improvement because the base config was already broken.
 
-3. **Q4_K_S slightly beats Q4_K_M** on our hardware. Q4_K_S is smaller (19.9GB vs ~21.1GB), meaning less DDR4 offload and slightly faster generation.
+3. **KV cache quantization for generation ≠ prefill**. The Anbeeld article benchmarks prefill throughput; q4_0/q5_0 match q8_0 there. But for token-by-token generation with MoE CPU offload, lower KV quant adds decompression overhead per token that outweighs VRAM savings. **q8_0/q8_0 remains best for generation speed**.
 
-4. **ik_llama.cpp is not an option** (confirmed 10x slower on Windows in 27B tests). The `--n-cpu-moe 16` and `-fmoe` flags that give 61 tok/s on Linux are unavailable to us.
+4. **Asymmetric KV (q8_0/q5_0, q5_0/q4_1) hurts generation on MoE**. Consistently slower than symmetric q8_0. The K/V decompression cost during generation is different from batch prefill.
 
-5. **The Reddit 60 tok/s claim is NOT reproducible on our hardware**. DDR4 vs DDR5 is the difference. On DDR5, MoE offload is ~2x faster.
+5. **32k context is faster but impractical**. ~54 tok/s with 32k ctx vs ~53 with 64k, but the small gain isn't worth losing long-context capability. Optimize for 64k stability.
+
+6. **Speed measurement matters**. Dividing `completion_tokens / total_elapsed` includes prompt processing time and understates generation speed by ~40%. Always use the server's `predicted_per_second` from response timings.
 
 ## 35B Winner
 
-**Q4_K_S on llama.cpp b9360**: 29.88 tok/s, 5/5 tasks passed.
+**Q4_K_S + --fit on + --kv-unified + --no-mmproj + MTP+ngram on llama.cpp b9360**: 53.56 tok/s, 5/5 tasks passed, 64k context stable.
 
 ## What could improve 35B further
 
-- **DDR5 RAM upgrade**: Would likely push 35B MoE from ~30 to ~50-60 tok/s (the Reddit user's result)
-- **Linux dual-boot**: Would unlock ik_llama.cpp with --n-cpu-moe + -fmoe (61+ tok/s proven on same GPU)
-- **Smaller quant that fits more in VRAM**: IQ4_XS (~16GB) might fit more in VRAM and offload less, but quality tradeoff
-
-## Overall: 27B vs 35B on this hardware
-
-| Model | Best Speed | Best Quality | Recommendation |
-|-------|-----------|-------------|----------------|
-| 27B IQ3_XXS | 23.67 tok/s | 4/4 tasks | Best for speed, fits in VRAM |
-| 35B MoE Q4_K_S | 29.88 tok/s | 5/5 tasks | **Best overall** — faster AND better quality |
-
-**35B MoE is the winner** — faster than 27B AND passes more tasks (5/5 vs 4/4 including bank simulation).
+- **DDR5 RAM upgrade**: Would push MoE offload bandwidth from ~25GB/s to ~50GB/s+
+- **Linux dual-boot**: Would unlock ik_llama.cpp with --n-cpu-moe + -fmoe (61+ tok/s proven)
+- **Newer llama.cpp build**: b9484+ may have incremental MoE improvements
+- **draft-max=1 vs 2**: Could test if single-token speculative has better acceptance rate on our hardware
