@@ -41,9 +41,53 @@
 - **IQ3_XXS-MTP GGUF**: Doesn't exist yet — would be ~10GB, more VRAM headroom
 - **draft-max=1 vs 3**: Could test if single-draft has better acceptance tradeoff
 
+## Long Context Performance (NEW)
+
+The MTP config (`start-server-27b.ps1`) is NOT suitable for long context. Speed collapses:
+
+| Context | 27B MTP (64K ctx, --fit on) |
+|---------|---------------------------|
+| 4K+ | 10-17 t/s |
+
+**Root cause**: Context size controls VRAM allocation. At 64K, --fit reserves KV for
+full 64K and offloads model layers to CPU = 13 t/s for ALL context sizes.
+
+**Fix**: Drop MTP, use 16K context with -ngl 99 -fit off. All layers fit in VRAM:
+
+| Context | 27B IQ3_XXS 16K ctx |
+|---------|---------------------|
+| 1.7K | 28.31 t/s |
+| 3.3K | 27.51 t/s |
+| 5K | 26.66 t/s |
+| 8.3K | 26.98 t/s |
+| 10K | 26.60 t/s |
+| 13.3K | 25.97 t/s |
+| 15K | 25.78 t/s |
+
+**Winner for long context**: `start-server-27b-longctx.ps1` — IQ3_XXS, no MTP, 16K ctx, q4_0 KV, -ngl 99.
+Stable ~26 t/s across entire 16K context window.
+
+**Why 16K context**: Context size = KV reservation = less VRAM for model layers.
+- 16K: 12.4GB VRAM = all layers on GPU = 26 t/s
+- 32K: 12.7GB = some layers to CPU = 22 t/s
+- 64K: 14.3GB = many layers to CPU = 13 t/s
+
+**KV cache comparison at 64K context (all slow due to offload)**:
+
+| KV Cache | 5K | 10K | 20K | 30K | 35K |
+|----------|-----|------|------|------|------|
+| q4_0 | 27.1 | 19.8 | 22.2 | 13.2 | - |
+| q8_0 | 27.0 | 25.3 | 25.6 | 14.8 | 19.2 |
+
+These speeds are misleading — the 64K ctx reservation already slows everything.
+Use 16K ctx instead for real speed.
+
+**iq4_nl KV is terrible**: Only 8 t/s at 5K context — decompression overhead destroys speed.
+
 ## 27B vs 35B Final Comparison
 
-| Model | Best Speed | Quality | Context | Recommendation |
-|-------|-----------|---------|---------|----------------|
-| 27B IQ3_M + MTP | 35.49 tok/s | 4/4 tasks | 64k | Best if you prefer dense model |
-| 35B MoE + MTP + ngram | 53.56 tok/s | 5/5 tasks | 64k | **Best overall** — faster AND better quality |
+| Model | Best Speed | Long Ctx Speed | Quality | Recommendation |
+|-------|-----------|----------------|---------|----------------|
+| 27B MTP (short ctx, 64K) | 35.49 t/s | collapses at 4K+ | 4/4 tasks | Short conversations only |
+| 27B Longctx (no MTP, 16K) | ~29 t/s | ~26 t/s at 15K | 4/4 tasks | Stable long conversations |
+| 35B MoE + MTP + ngram | 53.56 t/s | stable at 64k | 5/5 tasks | **Best overall** |

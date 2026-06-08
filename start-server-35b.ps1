@@ -52,7 +52,8 @@ $Args = @(
     "--spec-draft-n-max", "2",
     "--spec-ngram-mod-n-match", "40",
     "--spec-ngram-mod-n-min", "0",
-    "--spec-ngram-mod-n-max", "16"
+    "--spec-ngram-mod-n-max", "16",
+    "-rea", "off"
 )
 
 Write-Host "Starting llama-server (35B MoE production config)..."

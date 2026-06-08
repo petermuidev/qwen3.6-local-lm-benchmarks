@@ -1,18 +1,68 @@
 ## Configuration Guide — Qwen 3.6 on RTX 5060 Ti 16GB + DDR4 + Windows 11
 
-**Last updated**: 2026-06-08 — after full benchmark overhaul fixing broken configs
+**Last updated**: 2026-06-08 — added 27B long-context config, q8_0 vs q4_0 KV benchmarks
 
 ---
 
 ### Quick Start
 
-| Model | Script | Speed | Context | Quality |
-|-------|--------|-------|---------|---------|
-| 35B MoE Q4_K_S | `start-server-35b.ps1` | **53.56 t/s avg** (57 t/s multi-turn) | 64k | 5/5 tasks |
-| 35B MoE Q4_K_S (no MTP) | `start-server-35b-reddit60.ps1` | **46.03 t/s avg** | 64k | 5/5 tasks |
-| 27B Dense IQ3_XXS | `start-server-27b-iq3xxs.ps1` | **23.67 t/s** | 65k | 4/4 tasks |
+| Model | Script | Speed | Context | Quality | Best For |
+|-------|--------|-------|---------|---------|----------|
+| 35B MoE Q4_K_S | `start-server-35b.ps1` | **53.56 t/s avg** (57 t/s multi-turn) | 64k | 5/5 tasks | Best overall |
+| 35B MoE Q4_K_S (no MTP) | `start-server-35b-reddit60.ps1` | **46.03 t/s avg** | 64k | 5/5 tasks | Baseline comparison |
+| 27B Dense IQ3_M + MTP | `start-server-27b.ps1` | **~28 t/s** short, **15-23 t/s** opencode | 64k | 4/4 tasks | opencode/coding agent |
+| 27B Dense IQ3_XXS (raw API) | `start-server-27b-longctx.ps1` | **~26 t/s** stable to 15K | 16k | 4/4 tasks | Raw API long context |
 
-**Recommendation**: Use `start-server-35b.ps1` — faster AND better quality than 27B.
+*27B MTP with 64K ctx is best for opencode — client-side context management keeps active context manageable.
+Use longctx variant only for raw API use where you send full accumulated context.
+
+**Recommendation**: For opencode, use `start-server-27b.ps1`. For raw API, use `start-server-35b.ps1`.
+
+---
+
+### Production Config: 27B Long Context (`start-server-27b-longctx.ps1`)
+
+```powershell
+llama-server.exe -m Qwen3.6-27B-UD-IQ3_XXS.gguf `
+  --jinja --host 127.0.0.1 --port 8080 `
+  -t 16 -c 16384 -n 32768 -np 1 `
+  -ngl 99 -fit off -fa on --kv-unified --no-mmproj `
+  -ctk q4_0 -ctv q4_0
+```
+
+**Why this config for long context:**
+
+| Choice | Why |
+|--------|-----|
+| No MTP | Draft cache (~300MB) steals VRAM. MTP collapses to 10 t/s at 4K+ |
+| IQ3_XXS (11.2GB) | 800MB more VRAM headroom than IQ3_M |
+| 16K context | KEY: smaller ctx = less KV reservation = more layers on GPU. 64K ctx = 13 t/s, 16K ctx = 26 t/s |
+| `-ngl 99 -fit off` | All layers on GPU at 16K. Total ~12.4GB fits VRAM. `--fit on` over-reserves KV at 64K |
+| q4_0 KV | At 16K ctx, q4_0 keeps total ~12.4GB. q8_0 would push to ~13.5GB and spill layers |
+
+**27B Long Context Speed (benchmarked):**
+
+| Context | Speed |
+|---------|-------|
+| 1.7K | 28.31 t/s |
+| 3.3K | 27.51 t/s |
+| 5K | 26.66 t/s |
+| 8.3K | 26.98 t/s |
+| 10K | 26.60 t/s |
+| 13.3K | 25.97 t/s |
+| 15K | 25.78 t/s |
+
+Stable ~26 t/s across entire 16K context window. No collapse like MTP config.
+
+**Why not 64K context?**
+
+| Context Size | VRAM Used | Speed | Layers on GPU |
+|-------------|-----------|-------|---------------|
+| 16K | 12.4GB | 26 t/s | All |
+| 32K | 12.7GB | 22 t/s | Most |
+| 64K | 14.3GB | 13 t/s | Few (KV offload) |
+
+Context size directly controls how much VRAM is reserved for KV cache. More reservation = fewer model layers on GPU = slower generation.
 
 ---
 
@@ -84,9 +134,9 @@ Based on Anbeeld benchmarks + our own generation testing:
 | Approach | Result | Why |
 |----------|--------|-----|
 | ik_llama.cpp (any build) | 2 t/s or crash | AVX2 build is 10x slower than upstream. AVX512 crashes on Raptor Lake (partial AVX512) |
-| TurboQuant / atomic-llama-cpp | Never tested | Different fork, requires its own build. Low priority |
 | Lower KV quant for MoE generation | Slower | Decompression overhead > VRAM savings |
-| 32k context for speed | ~54 t/s but useless | Can't handle long sessions. 64k is the right tradeoff |
+| iq4_nl KV cache (27B dense) | 8 t/s at 5K | Massive decompression overhead, worse than q4_0 and q8_0 |
+| 32k context for speed | ~54 t/s but useless | Can't handle long sessions. 64k for 35B, 16k for 27B is the right tradeoff |
 
 ---
 
@@ -118,13 +168,15 @@ This is Reddit consensus for Qwen 3.6 quality. Our benchmark scripts include the
 |------|---------|
 | `start-server-35b.ps1` | 35B MoE production (MTP + ngram, 64k ctx) |
 | `start-server-35b-reddit60.ps1` | 35B baseline (no MTP, for comparison) |
-| `start-server-27b-iq3xxs.ps1` | 27B dense production |
+| `start-server-27b.ps1` | 27B dense short-context (MTP, 35 t/s at <1K ctx) |
+| `start-server-27b-longctx.ps1` | 27B dense long-context (no MTP, ~25 t/s at 20K) |
 | `stop-server.ps1` | Kill running server |
 | `benchmark-35b.py` | 35B benchmark (5 tasks, proper speed measurement) |
 | `benchmark-27b.py` | 27B benchmark (4 tasks, proper speed measurement) |
 | `benchmark_results/35B_SUMMARY.md` | 35B benchmark results |
 | `benchmark_results/27B_SUMMARY.md` | 27B benchmark results |
 | `benchmark_results/35B_LESSONS_LEARNED.md` | Detailed mistakes and methodology fixes |
+| `benchmark_results/27B_LESSONS_LEARNED.md` | 27B mistakes and long-context findings |
 
 ### Model Files
 
