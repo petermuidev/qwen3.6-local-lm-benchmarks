@@ -1,0 +1,60 @@
+$ErrorActionPreference = "Stop"
+
+$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$LlamaDir = Join-Path $Root "llama.cpp-b9360-cuda12"
+$ServerExe = Join-Path $LlamaDir "llama-server.exe"
+$ModelPath = Join-Path $Root "models\Qwen3.6-27B-MTP-GGUF\Qwen3.6-27B-IQ3_M-mtp.gguf"
+
+if (-not (Test-Path $ServerExe)) {
+    throw "Missing llama-server.exe at $ServerExe"
+}
+if (-not (Test-Path $ModelPath)) {
+    throw "Missing model at $ModelPath. Download with: hf download froggeric/Qwen3.6-27B-MTP-GGUF Qwen3.6-27B-IQ3_M-mtp.gguf --local-dir models\Qwen3.6-27B-MTP-GGUF"
+}
+
+# ═══ Production config for 27B Dense on RTX 5060 Ti 16GB ═══
+# Benchmarked: 35.49 tok/s avg (1.79x over non-MTP baseline)
+# 4/4 benchmark tasks passed, 64k context
+#
+# Why IQ3_M not IQ4_XS:
+#   IQ4_XS-MTP (15GB) + f16 draft KV + 64k ctx = overflows 16GB VRAM
+#   IQ3_M-MTP (12GB) leaves 4GB for KV + draft cache = fits VRAM
+#
+# Why draft-max=3:
+#   Per froggeric (1233pts Reddit post) — optimal for 27B MTP
+#   Acceptance rate ~67% on our hardware (upstream llama.cpp)
+
+$Context      = if ($env:LLAMA_CONTEXT)      { $env:LLAMA_CONTEXT }      else { "64000" }
+$Port         = if ($env:LLAMA_PORT)         { $env:LLAMA_PORT }         else { "8080" }
+$HostAddr     = if ($env:LLAMA_HOST)         { $env:LLAMA_HOST }         else { "127.0.0.1" }
+$Threads      = if ($env:LLAMA_THREADS)      { $env:LLAMA_THREADS }      else { "16" }
+
+$Args = @(
+    "-m", $ModelPath,
+    "--jinja",
+    "--host", $HostAddr,
+    "--port", $Port,
+    "-t", $Threads,
+    "-c", $Context,
+    "-n", "32768",
+    "-np", "1",
+    "-ngl", "99",
+    "-fa", "on",
+    "--kv-unified",
+    "--no-mmproj",
+    "-ctk", "q4_0",
+    "-ctv", "q4_0",
+    "--spec-type", "draft-mtp",
+    "--spec-draft-n-max", "3"
+)
+
+Write-Host "Starting llama-server (27B IQ3_M + MTP)..."
+Write-Host "  Model:    Qwen3.6-27B-IQ3_M-mtp (12GB, fits 16GB VRAM)"
+Write-Host "  GPU:      RTX 5060 Ti 16GB (-ngl 99, all GPU)"
+Write-Host "  Spec:     draft-mtp draft-max=3 (optimal per froggeric 1233pts)"
+Write-Host "  Context:  $Context"
+Write-Host "  KV cache: K=q4_0 V=q4_0 (dense model, q4_0 fine for generation)"
+Write-Host "  Bench:    35.49 t/s avg (1.79x over 19.86 t/s baseline)"
+Write-Host ""
+
+& $ServerExe @Args
