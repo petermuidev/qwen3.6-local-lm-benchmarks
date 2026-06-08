@@ -15,4 +15,4 @@ llama.cpp-b9360-cuda12/
 *.err.log
 
 # OMC session state (not project content)
-.omc/
+.omc/.reddit_token.json
