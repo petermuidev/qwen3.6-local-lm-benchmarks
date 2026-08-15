@@ -1,6 +1,6 @@
 ## Configuration Guide — Qwen 3.6 on RTX 5060 Ti 16GB + DDR4 + Windows 11
 
-**Last updated**: 2026-06-08 — added chat template fix, 32K context for opencode, MTP draft-max tuning
+**Last updated**: 2026-07-17 — added Spec Decoding Stack (DFlash + ngram-mod + ngram-map-k4v), new llama.cpp b10054 build, two new start-server scripts
 
 ---
 
@@ -8,15 +8,67 @@
 
 | Model | Script | Speed | Context | Quality | Best For |
 |-------|--------|-------|---------|---------|----------|
-| 35B MoE Q4_K_S | `start-server-35b.ps1` | **53.56 t/s avg** (57 t/s multi-turn) | 64k | 5/5 tasks | Best overall |
-| 35B MoE Q4_K_S (no MTP) | `start-server-35b-reddit60.ps1` | **46.03 t/s avg** | 64k | 5/5 tasks | Baseline comparison |
-| 27B Dense IQ3_M + MTP | `start-server-27b.ps1` | **~28 t/s** short, **~30 t/s** opencode | 32k | 4/4 tasks | opencode/coding agent |
+| **27B Dense + DFlash+ngram (NEW)** | `start-server-27b-dflash.ps1` | ~13 t/s single-turn, **~6x multi-turn** | 32k | TBD | opencode coding agent |
+| **35B MoE + ngram-mod (NEW)** | `start-server-35b-ngram.ps1` | ~25 t/s single-turn, higher multi-turn | 64k | TBD | pi CLI long-context API |
+| 35B MoE Q4_K_S (legacy) | `start-server-35b.ps1` | **53.56 t/s avg** (57 t/s multi-turn) | 64k | 5/5 tasks | Best overall (fallback) |
+| 35B MoE Q4_K_S (no MTP, legacy) | `start-server-35b-reddit60.ps1` | **46.03 t/s avg** | 64k | 5/5 tasks | Baseline comparison |
+| 27B Dense IQ3_M + MTP (legacy) | `start-server-27b.ps1` | **~28 t/s** short, **~30 t/s** opencode | 32k | 4/4 tasks | opencode fallback |
 | 27B Dense IQ3_XXS (raw API) | `start-server-27b-longctx.ps1` | **~26 t/s** stable to 15K | 16k | 4/4 tasks | Raw API long context |
 
-*27B MTP with 32K ctx is best for opencode — opencode auto-compacts at ~10-15K anyway, so 64K KV reservation is wasted VRAM.
-Use longctx variant only for raw API use where you send full accumulated context.
+**NEW (mid-July 2026)**: The top two configs use a new llama.cpp build (b10054, CUDA 12.4) with the DFlash + ngram-mod + ngram-map-k4v spec-decoding stack from Reddit research. See the **Spec Decoding Stack** section below.
 
-**Recommendation**: For opencode, use `start-server-27b.ps1`. For raw API, use `start-server-35b.ps1`.
+**Recommendation**: For opencode coding (multi-turn sessions), use `start-server-27b-dflash.ps1`. For pi CLI long-context API work, use `start-server-35b-ngram.ps1`. Fall back to legacy scripts if the new build has issues.
+
+**NEW (Aug 2026)**: `start-server-38b.ps1` — Qwen3.8-27B + MTP on llama.cpp b10437, ~53 t/s at 94K context. Replicates HF discussion #26 (same RTX 5060 Ti 16GB hardware). See **Qwen3.8-27B + MTP** section below.
+
+---
+
+### Qwen3.8-27B + MTP (`start-server-38b.ps1`)
+
+**Source**: [HF discussion #26](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/discussions/26) — hfmiguel on RTX 5060 Ti 16GB + 32GB RAM (same hardware as ours).
+
+```powershell
+llama-server.exe -m Qwen3.8-27B-UD-IQ3_XXS.gguf `
+  --no-mmproj --gpu-layers-draft all --spec-type draft-mtp --spec-draft-n-max 3 `
+  --n-gpu-layers all --fit off --load-mode none --no-mmap --no-warmup `
+  --flash-attn on --ctx-size 94208 --parallel 1 `
+  --cache-type-k q4_0 --cache-type-v q4_0 `
+  --batch-size 512 --ubatch-size 512 `
+  --jinja --temp 1 --top-p 0.95 --top-k 20 --min-p 0.0 `
+  --reasoning auto --reasoning-preserve `
+  --chat-template-kwargs '{"preserve-thinking": true, "reasoning_effort": "medium"}'
+```
+
+**Results (discussion #26)**: 35 t/s without MTP → 50-55 t/s with MTP at 94K context.
+
+**Verified Aug 2026 on our hardware**: GPU warmup is real — first request after boot ~15-30 t/s, consecutive back-to-back runs climb to **48-50 t/s** (measured: 32 → 42 → 50 → 48 on identical prompts). The GPU firmware ramps sustained performance after several requests; single cold requests never reach peak. For benchmarking, fire 3-4 requests first.
+
+**One-shot cold server**: 15 t/s. **Warm server, consecutive**: 48-50 t/s. This matches the discussion's "steady 50-55" — they ran the space-shooter prompt after the server had been up and exercised.
+
+**VRAM math (16GB)**:
+
+| Item | Size |
+|------|------|
+| IQ3_XXS model | 11.9 GB |
+| MTP draft head | ~0.3 GB |
+| KV q4_0 @ 94K | ~3.3 GB |
+| **Total** | **~15.5 GB — fits, tight** |
+
+**Key differences from Qwen3.6 configs**:
+
+| Choice | Why |
+|--------|-----|
+| `--load-mode none --no-mmap --fit off` | Forces everything to GPU, no fitting logic. The old "no-mmap hurts" lesson was MoE-specific; for a dense all-GPU model this combo is what discussion #26 used |
+| `reasoning_effort=medium` | Qwen3.8 defaults to `xhigh` which over-thinks. Medium = speed + quality balance |
+| `--reasoning-preserve` | Keeps reasoning context across turns (new Qwen3.8 feature) |
+| No `--chat-template-file` | Chat template embedded in Unsloth GGUF (commit "Add Unsloth style chat template") |
+| `-rea auto` instead of `-rea off` | Qwen3.8 thinking works correctly; reasoning is a feature, not a bug |
+| `draft-mtp` standalone | MTP weights embedded in GGUF — no separate `-md` draft model |
+| llama.cpp b10437 | Day-zero Qwen3.8 support (b10054 predates the arch) |
+
+**Draft-max tradeoff (from Qwen3.6 lessons #9)**: draft-max=3 can corrupt tool-call JSON when drafts are rejected mid-JSON. Set `$env:LLAMA_DRAFT_MAX="1"` for opencode agent sessions.
+
+**OOM fallback**: 94K is tight. If boot fails, `$env:LLAMA_CONTEXT="65536"; .\start-server-38b.ps1` (KV shrinks to ~2.3GB).
 
 ---
 

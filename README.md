@@ -6,15 +6,45 @@ Benchmarks, configurations, and case study for running Qwen3.6 models locally on
 
 On DDR4 bandwidth-starved hardware (~38 GB/s), a smaller **dense model** (27B IQ3_XXS at ~26 tok/s) produces **better code** than a bigger **MoE model** (35B-A3B Q4_K_S at ~33 tok/s). Speed is misleading — the dense model activates all 27B parameters per token vs MoE's 3.6B/35B, giving more reasoning capacity per step.
 
-**NEW**: Switching to ik_llama.cpp with `--n-cpu-moe 16` takes the same MoE config from ~26 tok/s to **61 tok/s** on identical hardware (proven by bobaburger on r/LocalLLaMA). This changes the MoE vs dense calculus — see [CONFIG_GUIDE.md](CONFIG_GUIDE.md).
+**VERIFIED (July 2026)**: ik_llama.cpp with `--n-cpu-moe 20` on our RTX 5060 Ti 16GB + DDR4 gives **43 tok/s at 64K context** (upstream was ~5-6 tok/s at same context). See [BENCHMARK_JULY2026.md](BENCHMARK_JULY2026.md) for full results.
 
-| Model | Speed | Sudoku | Bank simulation (8 steps) | Tokens used |
-|-------|-------|--------|--------------------------|-------------|
-| 27B dense IQ3_XXS (upstream) | ~26 tok/s | Correct | **Correct** (334.75, 523.24, 238.14) | Few |
-| 35B-A3B MoE Q4_K_S (upstream) | ~33 tok/s | Correct | **Wrong** (190.55, 523.24, 6.39) | 13,516 |
-| 35B-A3B MoE Q4_K_M (ik_llama.cpp) | **~61 tok/s** | ? | ? | ? |
+**NEW (mid-July 2026)**: llama.cpp b10054 + DFlash + ngram-mod spec-decoding stack on 27B dense gives **~6x on multi-turn coding** per Reddit research (u/FantasticNature7590, RTX 6000 PRO). On our hardware: 27B DFlash server boots, 55% DFlash draft acceptance on single-turn, 13.35 tok/s with spec active. Multi-turn speedup will be higher as n-gram cache fills. 35B MoE + ngram-mod server also set up — ngram-mod is free (host RAM) and kicks in on multi-turn sessions.
+
+**Luce Spark** (untested) could push this further — shrinks 35B from 20.5 GiB to 13.3 GiB by keeping only active MoE experts on GPU. See [REDDIT_SYNTHESIS.md](REDDIT_SYNTHESIS.md).
+
+| Model | Speed | Context | Sudoku | Bank simulation | Tokens |
+|-------|-------|---------|--------|-----------------|--------|
+| 27B dense IQ3_XXS (upstream) | ~26 tok/s | 32K | Correct | **Correct** | Few |
+| 27B dense IQ3_XXS + DFlash+ngram (b10054) | ~13 tok/s single-turn, ~6x multi-turn | 32K | ? | ? | ? |
+| 35B-A3B MoE Q4_K_M (ik_llama, n-cpu-moe 20) | **~43 tok/s** | 64K | ? | ? | ? |
+| 35B-A3B MoE Q4_K_M + ngram-mod (b10054) | ~25 tok/s single-turn, higher multi-turn | 64K | ? | ? | ? |
+| 35B-A3B MoE Q4_K_M (ik_llama, n-cpu-moe 16) | **~49 tok/s** | 48K max | ? | ? | ? |
 
 ## Quick Start
+
+### NEWEST: Qwen3.8-27B + MTP — ~53 t/s at 94K context (Aug 2026)
+
+```powershell
+.\start-server-38b.ps1
+```
+
+Build: llama.cpp b10437 (CUDA 12.4). Model: Qwen3.8-27B UD-IQ3_XXS (11.9GB, MTP weights embedded). Spec: `draft-mtp` draft-max=3. KV: q4_0. All layers on GPU. `reasoning_effort=medium` (xhigh over-thinks). Replicates HF discussion #26 — same GPU, 35→53 t/s from MTP. Chat template embedded in GGUF.
+
+### BEST for opencode coding — 27B dense + DFlash + ngram stack (NEW, ~6x on multi-turn)
+
+```powershell
+.\start-server-27b-dflash.ps1
+```
+
+Build: llama.cpp b10054 (CUDA 12.4). Model: Unsloth UD-IQ3_XXS (11.17GB) + Alittlehammmer DFlash-Q8_0 draft (1.8GB). Spec: `draft-dflash,ngram-mod,ngram-map-k4v`, `--fit on`, KV: q4_0, 32K ctx, `-rea off`. Best for opencode coding agent (multi-turn sessions where n-gram cache fills).
+
+### BEST for long context — 35B MoE + ngram-mod (NEW, PR #25545 CPU-offload gains)
+
+```powershell
+.\start-server-35b-ngram.ps1
+```
+
+Build: llama.cpp b10054 (CUDA 12.4, includes PR #25545 3x CPU-offload speedup). Model: Q4_K_M (19.7GB). Spec: `ngram-mod` (free on VRAM, drafts from host RAM). `--n-cpu-moe 20`, KV: q4_0, 64K ctx. Best for pi CLI long-context API work.
 
 ### Best for coding — 27B dense IQ3_XXS (~26 tok/s, upstream llama.cpp)
 
@@ -32,15 +62,24 @@ Model: Unsloth UD-IQ3_XXS (11.17GB), KV: q4_0, prompt cache OFF, no MTP.
 
 Model: Unsloth UD-Q4_K_S (19.9GB), KV: q8_0, prompt cache OFF, no MTP.
 
-### NEW: ik_llama.cpp configs (requires building from source)
+### BEST (proven fallback): ik_llama.cpp + 35B MoE (~43 tok/s at 64K context)
 
-These configs use ik_llama.cpp which gives **2-3x speed improvement** on MoE models. Build instructions in [CONFIG_GUIDE.md](CONFIG_GUIDE.md).
+```powershell
+.\start-server-ik-35b-moe-ncpumoe20.ps1
+```
 
-| Script | Expected speed | Key flags |
-|--------|---------------|-----------|
-| `start-server-ik-35b-moe-ncpumoe16.ps1` | ~61 tok/s | `--n-cpu-moe 16 -fmoe` |
-| `start-server-ik-35b-moe-fit.ps1` | ~74 tok/s | `--fit -fmoe` (no batch flags) |
-| `start-server-ik-27b-mtp.ps1` | ~30-35 tok/s (experimental) | `--spec-type mtp:n_max=1,p_min=0.0` |
+Model: Q4_K_M (19.7GB), KV: q4_0, `--n-cpu-moe 20`, all dense layers on GPU, MoE experts on CPU.
+
+### ik_llama.cpp + 35B MoE (~49 tok/s at up to 48K context)
+
+```powershell
+$env:LLAMA_CONTEXT = "49152"
+.\start-server-ik-35b-moe-ncpumoe20.ps1
+```
+
+Uses `--n-cpu-moe 16` (fewer experts on CPU = faster gen, but KV overflows at 48K+).
+
+### Previous configs (upstream llama.cpp)
 
 ### NEW: TurboQuant config (alternative fork)
 
@@ -56,6 +95,44 @@ Different runtime fork (atomic-llama-cpp-turboquant) with TurboQuant KV + NextN 
 .\stop-server.ps1
 ```
 
+## Spec Decoding Stack (mid-July 2026 research)
+
+Based on Reddit research on r/LocalLLaMA — see [REDDIT_SYNTHESIS.md](REDDIT_SYNTHESIS.md) for full sources.
+
+| Method | Speedup | VRAM cost | Best for |
+|--------|---------|-----------|----------|
+| Baseline | 1.0x | — | — |
+| MTP (existing) | 1.45-2.7x | ~300MB draft + draft KV | Chat, creative, varied prompts |
+| DFlash | 2.2-3.7x | ~5.5GB draft model | Coding, JSON, structured output |
+| DFlash + ngram-mod | **5.68x** | ~0GB extra (host RAM) | Multi-turn coding, editing own code |
+| DFlash + ngram-mod + ngram-map-k4v | **6.01x** | ~0GB extra | Same — marginally better than mod alone |
+
+Key flags (llama.cpp b10054+):
+```
+--spec-type draft-dflash,ngram-mod,ngram-map-k4v
+--spec-draft-n-max 15
+--spec-ngram-mod-n-match 24    # 24-token lookup key
+--spec-ngram-mod-n-min 48      # draft 48 tokens
+--spec-ngram-mod-n-max 64      # up to 64
+--spec-ngram-map-k4v-size-n 12
+--spec-ngram-map-k4v-size-m 48
+--spec-ngram-map-k4v-min-hits 1
+```
+
+**Key findings from Reddit (u/FantasticNature7590, RTX 6000 PRO, July 2026):**
+- 18-turn coding session: 321.5 vs 53.5 tok/s = 6.01x with full stack
+- Maintenance turns (editing existing code): 385 tok/s, 7.5x baseline
+- n-gram advantage GROWS with session (more context = more to copy); baseline decays
+- On varied one-shot prompts n-gram adds nothing (cache starts empty)
+- n-gram drafters are literally free on GPU (tables in host RAM)
+- Lossless on MATH-500 (440/500 vs 435/500) and LiveCodeBench
+- DFlash acceptance best at temp=0 (greedy)
+
+**On our hardware (RTX 5060 Ti 16GB + DDR4):**
+- 27B IQ3_XXS (11.17GB) + DFlash Q8_0 (1.8GB) + KV q4_0 fits in 16GB VRAM with `--fit on` (auto GPU/CPU split)
+- 35B MoE (19.7GB) + DFlash (5.5GB) does NOT fit — use ngram-mod only (free VRAM)
+- The `dflash requires ctx_other to be set` warning during memory fitting is benign — DFlash still activates (verified via `draft_n > 0` in timings)
+
 ## Models Required
 
 ### Upstream llama.cpp models (Unsloth)
@@ -65,6 +142,7 @@ Different runtime fork (atomic-llama-cpp-turboquant) with TurboQuant KV + NextN 
 | 27B IQ3_XXS | `unsloth/Qwen3.6-27B-GGUF` | `Qwen3.6-27B-UD-IQ3_XXS.gguf` | 11.17 GB |
 | 35B-A3B Q4_K_S | `unsloth/Qwen3.6-35B-A3B-MTP-GGUF` | `Qwen3.6-35B-A3B-UD-Q4_K_S.gguf` | 19.9 GB |
 | 35B-A3B Q4_K_M | `unsloth/Qwen3.6-35B-A3B-MTP-GGUF` | `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` | 21.1 GB |
+| Qwen3.8 27B IQ3_XXS | `unsloth/Qwen3.8-27B-GGUF` | `Qwen3.8-27B-UD-IQ3_XXS.gguf` | 11.9 GB |
 
 ### ik_llama.cpp models (additional)
 
@@ -111,19 +189,23 @@ Both models are configured as a local provider in `~/.config/opencode/opencode.j
 
 Switch models with `/models` in opencode. Start the matching llama-server first.
 
-## Key Lessons (updated with ik_llama.cpp findings)
+## Key Lessons (updated July 2026 with Luce Spark + 5080 findings)
 
 1. **ik_llama.cpp is the biggest single fix** — 26→61 tok/s on same hardware with `--n-cpu-moe 16 -fmoe`. See [CONFIG_GUIDE.md](CONFIG_GUIDE.md) for build instructions.
-2. **DDR4 bandwidth is the bottleneck** — Model fit > quant quality. IQ3_XXS (11.17GB) beats IQ4_XS (14.38GB) because it fits in VRAM.
-3. **Prompt cache kills DDR4 performance** — `--cache-ram 0` prevents progressive speed collapse.
-4. **q4_0 KV is lossless but not always faster** — Best for dense (frees VRAM), worse for hybrid MoE.
-5. **`--fit` auto beats manual MoE offload on upstream** — 36.1 vs 23.1 tok/s. But ik_llama.cpp `--n-cpu-moe 16` beats both at 61 tok/s.
-6. **MTP is net negative on upstream/DDR4** — But ik_llama.cpp MTP for 27B dense (+27% on RTX 3090) changes this; needs testing on DDR4.
-7. **Dense > MoE for coding on upstream** — All 27B params active vs 3.6B/35B. With ik_llama.cpp MoE speed gains, re-benchmark quality.
-8. **Disable thinking** — Send `chat_template_kwargs.enable_thinking: false`.
-9. **Only one llama-server at a time** — Multiple servers destabilize the system.
-10. **Do NOT use `-rtr` with `--n-cpu-moe`** — Breaks hybrid CPU/GPU MoE offload in ik_llama.cpp.
-11. **Do NOT use Unsloth `_XL` GGUF with ik_llama.cpp** — f16 tensors break it.
+2. **Luce Spark could eliminate DDR4 offload entirely** — 35B MoE shrinks from 20.5→13.3 GiB by keeping only active experts on GPU. If it works, this is the biggest upgrade for 16GB VRAM cards.
+3. **MTP is net-negative for 35B MoE on 16GB VRAM** — RTX 5080 16GB evidence: MTP overhead reduces context window and acceptance rate is too low to compensate. This only applies to 16GB; 12GB and 24GB cards still benefit.
+4. **DDR4 bandwidth is the bottleneck** — Model fit > quant quality. IQ3_XXS (11.17GB) beats IQ4_XS (14.38GB) because it fits in VRAM.
+5. **Prompt cache kills DDR4 performance** — `--cache-ram 0` prevents progressive speed collapse.
+6. **q4_0 KV is lossless but not always faster** — Best for dense (frees VRAM), worse for hybrid MoE.
+7. **`--fit` auto beats manual MoE offload on upstream** — 36.1 vs 23.1 tok/s. But ik_llama.cpp `--n-cpu-moe 16` beats both at 61 tok/s.
+8. **`--fit-target 1536` may be better than `--fit`** — From RTX 5080 benchmarks at 131K context.
+9. **Increase `-ub` for better prompt processing** — `-ub 2048` or higher with `--n-cpu-moe` gives huge prefill speedup.
+10. **Dense > MoE for coding on upstream** — All 27B params active vs 3.6B/35B. With ik_llama.cpp or Luce Spark MoE speed gains, re-benchmark quality.
+11. **Disable thinking** — Send `chat_template_kwargs.enable_thinking: false`.
+12. **Only one llama-server at a time** — Multiple servers destabilize the system.
+13. **Do NOT use `-rtr` with `--n-cpu-moe`** — Breaks hybrid CPU/GPU MoE offload in ik_llama.cpp.
+14. **Do NOT use Unsloth `_XL` GGUF with ik_llama.cpp** — f16 tensors break it.
+15. **Short-context benchmarks are misleading** — 80 tok/s at 512 tokens drops to 30-40 at 100K. Always benchmark at realistic context lengths.
 
 ## Hardware
 
