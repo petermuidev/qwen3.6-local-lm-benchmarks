@@ -22,13 +22,22 @@ On DDR4 bandwidth-starved hardware (~38 GB/s), a smaller **dense model** (27B IQ
 
 ## Quick Start
 
-### NEWEST: Qwen3.8-27B + MTP — ~53 t/s at 94K context (Aug 2026)
+### NEWEST: Qwen3.8-27B + MTP — ~50 t/s at 94K context (Aug 2026)
 
 ```powershell
 .\start-server-38b.ps1
 ```
 
-Build: llama.cpp b10437 (CUDA 12.4). Model: Qwen3.8-27B UD-IQ3_XXS (11.9GB, MTP weights embedded). Spec: `draft-mtp` draft-max=3. KV: q4_0. All layers on GPU. `reasoning_effort=medium` (xhigh over-thinks). Replicates HF discussion #26 — same GPU, 35→53 t/s from MTP. Chat template embedded in GGUF.
+Build: llama.cpp b10437 (CUDA 12.4). Model: Qwen3.8-27B UD-IQ3_XXS (11.9GB, MTP weights embedded). Spec: `draft-mtp` draft-max=3. KV: q4_0. All layers on GPU. `reasoning_effort=medium` (xhigh over-thinks). Chat template embedded in GGUF. Replicates HF discussion #26 — same GPU.
+
+**Env overrides**: `LLAMA_CONTEXT` (default 94208), `LLAMA_PORT` (8080), `LLAMA_HOST`, `LLAMA_THREADS`, `LLAMA_DRAFT_MAX` (3).
+
+**Verified on our hardware (Aug 2026)**:
+- **GPU warmup is real**: first request after boot ~15-30 t/s; consecutive back-to-back runs climb to **48-50 t/s** (measured 32 → 42 → 50 → 48 on identical prompts). Fire 2-3 small prompts before benchmarking or heavy work.
+- Cold one-shot (space-shooter prompt, raw API): 15 t/s. Warm sustained: 48-50 t/s.
+- MTP gives ~2x over no-MTP baseline (10.5 → 21 t/s cold).
+- **Draft-max tradeoff**: draft-max=3 matches discussion speed but can corrupt tool-call JSON (same issue as Qwen3.6). Use `$env:LLAMA_DRAFT_MAX="1"` for opencode/pi agent sessions.
+- **pi CLI**: registered as `local/qwen3.8-27b` (thinking on, 94K ctx). Switch with `/models` in pi.
 
 ### BEST for opencode coding — 27B dense + DFlash + ngram stack (NEW, ~6x on multi-turn)
 
