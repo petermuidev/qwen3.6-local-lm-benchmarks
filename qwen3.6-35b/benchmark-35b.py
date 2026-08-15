@@ -1,15 +1,15 @@
 """
-Qwen 3.6 27B Dense -- Benchmark Script
+Qwen 3.6 35B MoE -- Benchmark Script
 
 Run against whatever server is currently running (llama.cpp or ik_llama.cpp).
-Results saved to benchmark_results/27b_<label>.json with runtime label.
+Results saved to benchmark_results/35b_<label>.json with runtime label.
 
 Usage:
-  1. Start server:  start-server-27b-iq3xxs.ps1          (llama.cpp baseline)
-  2. Run bench:     python benchmark-27b.py --label llama-b9360-iq3xxs
-  3. Start server:  start-server-ik-27b-mtp.ps1          (ik_llama.cpp + MTP)
-  4. Run bench:     python benchmark-27b.py --label ik-mtp-q8
-  5. Compare:       python benchmark-27b.py --compare
+  1. Start server:  start-server-q4ks-vanilla.ps1       (llama.cpp baseline)
+  2. Run bench:     python benchmark-35b.py --label llama-b9360-q4ks
+  3. Start server:  start-server-ik-35b-moe-ncpumoe16.ps1 (ik_llama.cpp n-cpu-moe)
+  4. Run bench:     python benchmark-35b.py --label ik-ncpumoe16
+  5. Compare:       python benchmark-35b.py --compare
 """
 
 import json
@@ -30,7 +30,7 @@ SERVER_URL = os.environ.get("LLAMA_BENCH_URL", "http://127.0.0.1:8080/v1/chat/co
 TEMPERATURE = float(os.environ.get("LLAMA_BENCH_TEMPERATURE", "0.6"))
 MAX_TOKENS = int(os.environ.get("LLAMA_BENCH_MAX_TOKENS", "700"))
 TIMEOUT = int(os.environ.get("LLAMA_BENCH_TIMEOUT", "900"))
-RESULTS_DIR = Path(__file__).parent / "benchmark_results"
+RESULTS_DIR = Path(__file__).parent.parent / "benchmark_results"
 
 # Qwen 3.6 recommended sampling: temp=0.6, top_p=0.95, top_k=20, min_p=0, presence_penalty=1.25
 SAMPLING = {
@@ -145,6 +145,44 @@ assert merge_intervals([[1, 4], [0, 4]]) == [[0, 4]]
 assert merge_intervals([[1, 4], [2, 3]]) == [[1, 4]]
 """,
     },
+    {
+        "name": "bank_simulation",
+        "prompt": """
+Write Python 3 code only.
+Implement:
+
+`class Bank:`
+- `__init__(self)`
+- `deposit(self, account: str, amount: float) -> None`
+- `withdraw(self, account: str, amount: float) -> bool`
+- `get_balance(self, account: str) -> float`
+- `transfer(self, from_acc: str, to_acc: str, amount: float) -> bool`
+
+Rules:
+- withdraw returns False if insufficient funds or account does not exist
+- transfer returns False if withdrawal fails; must be atomic (both or neither)
+- get_balance returns 0.0 for non-existent accounts
+- deposit creates account if it does not exist
+Use only the Python standard library.
+Do not include explanation or markdown fences.
+""",
+        "test_code": """
+b = Bank()
+b.deposit("alice", 100.0)
+assert b.get_balance("alice") == 100.0
+assert b.withdraw("alice", 50.0) == True
+assert b.get_balance("alice") == 50.0
+assert b.withdraw("alice", 60.0) == False
+assert b.get_balance("bob") == 0.0
+b.deposit("bob", 200.0)
+assert b.transfer("bob", "alice", 75.0) == True
+assert b.get_balance("bob") == 125.0
+assert b.get_balance("alice") == 125.0
+assert b.transfer("bob", "alice", 200.0) == False
+assert b.get_balance("bob") == 125.0
+assert b.get_balance("alice") == 125.0
+""",
+    },
 ]
 
 
@@ -157,7 +195,7 @@ def extract_python_code(text: str) -> str:
 
 def call_model(prompt: str) -> dict:
     payload = {
-        "model": "Qwen3.6-27B",
+        "model": "Qwen3.6-35B-A3B",
         "messages": [
             {
                 "role": "system",
@@ -249,7 +287,7 @@ def wait_for_server() -> None:
                 SERVER_URL,
                 data=json.dumps(
                     {
-                        "model": "Qwen3.6-27B",
+                        "model": "Qwen3.6-35B-A3B",
                         "messages": [{"role": "user", "content": "print(1)"}],
                         "temperature": 0,
                         "max_tokens": 1,
@@ -322,7 +360,7 @@ def run_benchmark(label: str) -> int:
 
     avg_tps = round(sum(all_tps) / len(all_tps), 2) if all_tps else None
     summary = {
-        "model_size": "27B",
+        "model_size": "35B-MoE",
         "label": label,
         "timestamp": datetime.now().isoformat(),
         "server_url": SERVER_URL,
@@ -333,11 +371,11 @@ def run_benchmark(label: str) -> int:
         "results": results,
     }
 
-    out_path = RESULTS_DIR / f"27b_{label}.json"
+    out_path = RESULTS_DIR / f"35b_{label}.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
-    print(f"=== 27B Results [{label}] ===")
+    print(f"=== 35B MoE Results [{label}] ===")
     print(f"  Passed:  {passed}/{len(TASKS)}")
     print(f"  Avg t/s: {avg_tps}")
     print(f"  Saved:   {out_path}")
@@ -346,9 +384,9 @@ def run_benchmark(label: str) -> int:
 
 def compare_results() -> None:
     RESULTS_DIR.mkdir(exist_ok=True)
-    files = sorted(RESULTS_DIR.glob("27b_*.json"))
+    files = sorted(RESULTS_DIR.glob("35b_*.json"))
     if not files:
-        print("No 27B benchmark results found in benchmark_results/")
+        print("No 35B benchmark results found in benchmark_results/")
         return
 
     print(f"{'Label':<30} {'Passed':>7} {'Avg t/s':>9} {'Date':>20}")
@@ -358,17 +396,17 @@ def compare_results() -> None:
             data = json.load(fh)
         label = data.get("label", f.stem)
         passed = f"{data.get('tasks_passed', '?')}/{data.get('tasks_total', '?')}"
-        tps = data.get("average_tokens_per_sec", "—")
-        ts = data.get("timestamp", "—")[:19]
+        tps = data.get("average_tokens_per_sec", "-")
+        ts = data.get("timestamp", "-")[:19]
         print(f"{label:<30} {passed:>7} {str(tps):>9} {ts:>20}")
 
 
 def main() -> int:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Qwen 3.6 27B Dense Benchmark")
-    parser.add_argument("--label", default=None, help="Config label (e.g. llama-b9360-iq3xxs, ik-mtp-q8)")
-    parser.add_argument("--compare", action="store_true", help="Compare all saved 27B results")
+    parser = argparse.ArgumentParser(description="Qwen 3.6 35B MoE Benchmark")
+    parser.add_argument("--label", default=None, help="Config label (e.g. llama-b9360-q4ks, ik-ncpumoe16)")
+    parser.add_argument("--compare", action="store_true", help="Compare all saved 35B results")
     args = parser.parse_args()
 
     if args.compare:
@@ -376,7 +414,7 @@ def main() -> int:
         return 0
 
     if not args.label:
-        print("ERROR: --label is required (e.g. --label llama-b9360-iq3xxs)")
+        print("ERROR: --label is required (e.g. --label llama-b9360-q4ks)")
         print("Use --compare to see saved results.")
         return 1
 

@@ -27,3 +27,4 @@ reddit.txt
 
 # OMC session state (not project content)
 .omc/
+"__pycache__/"  

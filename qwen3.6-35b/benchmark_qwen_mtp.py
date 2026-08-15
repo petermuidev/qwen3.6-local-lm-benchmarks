@@ -1,17 +1,3 @@
-"""
-Qwen 3.6 35B MoE -- Benchmark Script
-
-Run against whatever server is currently running (llama.cpp or ik_llama.cpp).
-Results saved to benchmark_results/35b_<label>.json with runtime label.
-
-Usage:
-  1. Start server:  start-server-q4ks-vanilla.ps1       (llama.cpp baseline)
-  2. Run bench:     python benchmark-35b.py --label llama-b9360-q4ks
-  3. Start server:  start-server-ik-35b-moe-ncpumoe16.ps1 (ik_llama.cpp n-cpu-moe)
-  4. Run bench:     python benchmark-35b.py --label ik-ncpumoe16
-  5. Compare:       python benchmark-35b.py --compare
-"""
-
 import json
 import os
 import re
@@ -22,24 +8,14 @@ import textwrap
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
-from pathlib import Path
 
 
 SERVER_URL = os.environ.get("LLAMA_BENCH_URL", "http://127.0.0.1:8080/v1/chat/completions")
-TEMPERATURE = float(os.environ.get("LLAMA_BENCH_TEMPERATURE", "0.6"))
+MODEL_NAME = os.environ.get("LLAMA_BENCH_MODEL", "Qwen3.6-35B-A3B-UD-Q4_K_M")
+TEMPERATURE = float(os.environ.get("LLAMA_BENCH_TEMPERATURE", "0.2"))
 MAX_TOKENS = int(os.environ.get("LLAMA_BENCH_MAX_TOKENS", "700"))
 TIMEOUT = int(os.environ.get("LLAMA_BENCH_TIMEOUT", "900"))
-RESULTS_DIR = Path(__file__).parent / "benchmark_results"
 
-# Qwen 3.6 recommended sampling: temp=0.6, top_p=0.95, top_k=20, min_p=0, presence_penalty=1.25
-SAMPLING = {
-    "temperature": TEMPERATURE,
-    "top_p": 0.95,
-    "top_k": 20,
-    "min_p": 0.0,
-    "presence_penalty": 1.25,
-}
 
 TASKS = [
     {
@@ -123,66 +99,6 @@ assert result == [
 assert all_segmentations("catsandog", {"cats", "dog", "sand", "and", "cat"}) == []
 """,
     },
-    {
-        "name": "merge_intervals",
-        "prompt": """
-Write Python 3 code only.
-Implement:
-
-`def merge_intervals(intervals: list[list[int]]) -> list[list[int]]:`
-
-Given a list of [start, end] intervals (inclusive), merge all overlapping intervals
-and return the result sorted by start. Empty input returns empty list.
-Use only the Python standard library.
-Do not include explanation or markdown fences.
-""",
-        "test_code": """
-assert merge_intervals([]) == []
-assert merge_intervals([[1, 3]]) == [[1, 3]]
-assert merge_intervals([[1, 3], [2, 6], [8, 10], [15, 18]]) == [[1, 6], [8, 10], [15, 18]]
-assert merge_intervals([[1, 4], [4, 5]]) == [[1, 5]]
-assert merge_intervals([[1, 4], [0, 4]]) == [[0, 4]]
-assert merge_intervals([[1, 4], [2, 3]]) == [[1, 4]]
-""",
-    },
-    {
-        "name": "bank_simulation",
-        "prompt": """
-Write Python 3 code only.
-Implement:
-
-`class Bank:`
-- `__init__(self)`
-- `deposit(self, account: str, amount: float) -> None`
-- `withdraw(self, account: str, amount: float) -> bool`
-- `get_balance(self, account: str) -> float`
-- `transfer(self, from_acc: str, to_acc: str, amount: float) -> bool`
-
-Rules:
-- withdraw returns False if insufficient funds or account does not exist
-- transfer returns False if withdrawal fails; must be atomic (both or neither)
-- get_balance returns 0.0 for non-existent accounts
-- deposit creates account if it does not exist
-Use only the Python standard library.
-Do not include explanation or markdown fences.
-""",
-        "test_code": """
-b = Bank()
-b.deposit("alice", 100.0)
-assert b.get_balance("alice") == 100.0
-assert b.withdraw("alice", 50.0) == True
-assert b.get_balance("alice") == 50.0
-assert b.withdraw("alice", 60.0) == False
-assert b.get_balance("bob") == 0.0
-b.deposit("bob", 200.0)
-assert b.transfer("bob", "alice", 75.0) == True
-assert b.get_balance("bob") == 125.0
-assert b.get_balance("alice") == 125.0
-assert b.transfer("bob", "alice", 200.0) == False
-assert b.get_balance("bob") == 125.0
-assert b.get_balance("alice") == 125.0
-""",
-    },
 ]
 
 
@@ -195,18 +111,23 @@ def extract_python_code(text: str) -> str:
 
 def call_model(prompt: str) -> dict:
     payload = {
-        "model": "Qwen3.6-35B-A3B",
+        "model": MODEL_NAME,
         "messages": [
             {
                 "role": "system",
                 "content": "You are a careful Python programmer. Thinking mode is disabled. Return only valid Python code with no explanation.",
             },
-            {"role": "user", "content": textwrap.dedent(prompt).strip()},
+            {
+                "role": "user",
+                "content": textwrap.dedent(prompt).strip(),
+            },
         ],
+        "temperature": TEMPERATURE,
         "max_tokens": MAX_TOKENS,
         "stream": False,
-        "chat_template_kwargs": {"enable_thinking": False},
-        **SAMPLING,
+        "chat_template_kwargs": {
+            "enable_thinking": False
+        },
     }
 
     data = json.dumps(payload).encode("utf-8")
@@ -227,14 +148,9 @@ def call_model(prompt: str) -> dict:
     usage = parsed.get("usage", {})
     completion_tokens = usage.get("completion_tokens")
     prompt_tokens = usage.get("prompt_tokens")
-
-    # Use server-reported generation speed (predicted_per_second) when available.
-    # Fallback to completion_tokens/elapsed includes prompt processing time
-    # and understates true generation speed.
-    timings = parsed.get("timings", {})
-    tps_server = timings.get("predicted_per_second")
-    tps_naive = completion_tokens / elapsed if completion_tokens and elapsed > 0 else None
-    tps = tps_server if tps_server else tps_naive
+    tps = None
+    if completion_tokens and elapsed > 0:
+        tps = completion_tokens / elapsed
 
     return {
         "raw": parsed,
@@ -242,8 +158,7 @@ def call_model(prompt: str) -> dict:
         "elapsed_sec": elapsed,
         "completion_tokens": completion_tokens,
         "prompt_tokens": prompt_tokens,
-        "tokens_per_sec": round(tps, 2) if tps else None,
-        "tokens_per_sec_naive": round(tps_naive, 2) if tps_naive else None,
+        "tokens_per_sec": tps,
     }
 
 
@@ -278,7 +193,6 @@ def run_python_tests(code: str, test_code: str) -> tuple[bool, str]:
 
 
 def wait_for_server() -> None:
-    print(f"Waiting for server: {SERVER_URL}")
     started = time.time()
     last_error = None
     while time.time() - started < 600:
@@ -287,12 +201,14 @@ def wait_for_server() -> None:
                 SERVER_URL,
                 data=json.dumps(
                     {
-                        "model": "Qwen3.6-35B-A3B",
+                        "model": MODEL_NAME,
                         "messages": [{"role": "user", "content": "print(1)"}],
                         "temperature": 0,
                         "max_tokens": 1,
                         "stream": False,
-                        "chat_template_kwargs": {"enable_thinking": False},
+                        "chat_template_kwargs": {
+                            "enable_thinking": False
+                        },
                     }
                 ).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
@@ -301,20 +217,19 @@ def wait_for_server() -> None:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 if resp.status == 200:
                     return
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             last_error = exc
             time.sleep(3)
     raise RuntimeError(f"Server did not become ready. Last error: {last_error}")
 
 
-def run_benchmark(label: str) -> int:
-    RESULTS_DIR.mkdir(exist_ok=True)
+def main() -> int:
+    print(f"Waiting for server: {SERVER_URL}")
     wait_for_server()
     print("Server is ready.\n")
 
     results = []
     passed = 0
-    all_tps = []
 
     for task in TASKS:
         print(f"=== {task['name']} ===")
@@ -324,11 +239,17 @@ def run_benchmark(label: str) -> int:
             ok, test_output = run_python_tests(code, task["test_code"])
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
-            results.append({"name": task["name"], "passed": False, "error": f"HTTP {exc.code}: {body}"})
+            results.append(
+                {
+                    "name": task["name"],
+                    "passed": False,
+                    "error": f"HTTP {exc.code}: {body}",
+                }
+            )
             print(results[-1]["error"])
             print()
             continue
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             results.append({"name": task["name"], "passed": False, "error": str(exc)})
             print(f"Error: {exc}\n")
             continue
@@ -347,78 +268,38 @@ def run_benchmark(label: str) -> int:
 
         if ok:
             passed += 1
-        if item["tokens_per_sec"]:
-            all_tps.append(item["tokens_per_sec"])
 
-        print(f"  passed:   {ok}")
-        print(f"  tok/s:    {item['tokens_per_sec']}")
-        print(f"  tokens:   {item['completion_tokens']}")
-        print(f"  elapsed:  {item['elapsed_sec']}s")
+        print(f"passed: {ok}")
+        print(f"elapsed_sec: {item['elapsed_sec']}")
+        print(f"completion_tokens: {item['completion_tokens']}")
+        print(f"tokens_per_sec: {item['tokens_per_sec']}")
         if not ok:
-            print(f"  test_output: {test_output[-500:]}")
+            print("test_output:")
+            print(item["test_output"])
         print()
 
-    avg_tps = round(sum(all_tps) / len(all_tps), 2) if all_tps else None
+    aggregate_tps = [
+        result["tokens_per_sec"]
+        for result in results
+        if isinstance(result.get("tokens_per_sec"), (int, float))
+    ]
     summary = {
-        "model_size": "35B-MoE",
-        "label": label,
-        "timestamp": datetime.now().isoformat(),
         "server_url": SERVER_URL,
-        "sampling": SAMPLING,
+        "model": MODEL_NAME,
         "tasks_passed": passed,
         "tasks_total": len(TASKS),
-        "average_tokens_per_sec": avg_tps,
+        "average_tokens_per_sec": round(sum(aggregate_tps) / len(aggregate_tps), 2) if aggregate_tps else None,
         "results": results,
     }
 
-    out_path = RESULTS_DIR / f"35b_{label}.json"
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
+    out_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "benchmark_results.json")
+    with open(out_path, "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
 
-    print(f"=== 35B MoE Results [{label}] ===")
-    print(f"  Passed:  {passed}/{len(TASKS)}")
-    print(f"  Avg t/s: {avg_tps}")
-    print(f"  Saved:   {out_path}")
+    print("=== summary ===")
+    print(json.dumps(summary, indent=2))
+    print(f"\nSaved results to {out_path}")
     return 0 if passed == len(TASKS) else 1
-
-
-def compare_results() -> None:
-    RESULTS_DIR.mkdir(exist_ok=True)
-    files = sorted(RESULTS_DIR.glob("35b_*.json"))
-    if not files:
-        print("No 35B benchmark results found in benchmark_results/")
-        return
-
-    print(f"{'Label':<30} {'Passed':>7} {'Avg t/s':>9} {'Date':>20}")
-    print("-" * 70)
-    for f in files:
-        with open(f, encoding="utf-8") as fh:
-            data = json.load(fh)
-        label = data.get("label", f.stem)
-        passed = f"{data.get('tasks_passed', '?')}/{data.get('tasks_total', '?')}"
-        tps = data.get("average_tokens_per_sec", "-")
-        ts = data.get("timestamp", "-")[:19]
-        print(f"{label:<30} {passed:>7} {str(tps):>9} {ts:>20}")
-
-
-def main() -> int:
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Qwen 3.6 35B MoE Benchmark")
-    parser.add_argument("--label", default=None, help="Config label (e.g. llama-b9360-q4ks, ik-ncpumoe16)")
-    parser.add_argument("--compare", action="store_true", help="Compare all saved 35B results")
-    args = parser.parse_args()
-
-    if args.compare:
-        compare_results()
-        return 0
-
-    if not args.label:
-        print("ERROR: --label is required (e.g. --label llama-b9360-q4ks)")
-        print("Use --compare to see saved results.")
-        return 1
-
-    return run_benchmark(args.label)
 
 
 if __name__ == "__main__":

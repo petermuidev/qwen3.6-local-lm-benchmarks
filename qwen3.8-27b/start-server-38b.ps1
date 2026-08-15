@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $LlamaDir = Join-Path $Root "llama.cpp-b10437-cuda12"
 $ServerExe = Join-Path $LlamaDir "llama-server.exe"
 $ModelPath = Join-Path $Root "models\Qwen3.8-27B-GGUF\Qwen3.8-27B-UD-IQ3_XXS.gguf"

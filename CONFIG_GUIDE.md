@@ -8,22 +8,22 @@
 
 | Model | Script | Speed | Context | Quality | Best For |
 |-------|--------|-------|---------|---------|----------|
-| **27B Dense + DFlash+ngram (NEW)** | `start-server-27b-dflash.ps1` | ~13 t/s single-turn, **~6x multi-turn** | 32k | TBD | opencode coding agent |
-| **35B MoE + ngram-mod (NEW)** | `start-server-35b-ngram.ps1` | ~25 t/s single-turn, higher multi-turn | 64k | TBD | pi CLI long-context API |
-| 35B MoE Q4_K_S (legacy) | `start-server-35b.ps1` | **53.56 t/s avg** (57 t/s multi-turn) | 64k | 5/5 tasks | Best overall (fallback) |
-| 35B MoE Q4_K_S (no MTP, legacy) | `start-server-35b-reddit60.ps1` | **46.03 t/s avg** | 64k | 5/5 tasks | Baseline comparison |
-| 27B Dense IQ3_M + MTP (legacy) | `start-server-27b.ps1` | **~28 t/s** short, **~30 t/s** opencode | 32k | 4/4 tasks | opencode fallback |
-| 27B Dense IQ3_XXS (raw API) | `start-server-27b-longctx.ps1` | **~26 t/s** stable to 15K | 16k | 4/4 tasks | Raw API long context |
+| **27B Dense + DFlash+ngram (NEW)** | `qwen3.6-27b\start-server-27b-dflash.ps1` | ~13 t/s single-turn, **~6x multi-turn** | 32k | TBD | opencode coding agent |
+| **35B MoE + ngram-mod (NEW)** | `qwen3.6-35b\start-server-35b-ngram.ps1` | ~25 t/s single-turn, higher multi-turn | 64k | TBD | pi CLI long-context API |
+| 35B MoE Q4_K_S (legacy) | `qwen3.6-35b\start-server-35b.ps1` | **53.56 t/s avg** (57 t/s multi-turn) | 64k | 5/5 tasks | Best overall (fallback) |
+| 35B MoE Q4_K_S (no MTP, legacy) | `qwen3.6-35b\start-server-35b-reddit60.ps1` | **46.03 t/s avg** | 64k | 5/5 tasks | Baseline comparison |
+| 27B Dense IQ3_M + MTP (legacy) | `qwen3.6-27b\start-server-27b.ps1` | **~28 t/s** short, **~30 t/s** opencode | 32k | 4/4 tasks | opencode fallback |
+| 27B Dense IQ3_XXS (raw API) | `qwen3.6-27b\start-server-27b-longctx.ps1` | **~26 t/s** stable to 15K | 16k | 4/4 tasks | Raw API long context |
 
 **NEW (mid-July 2026)**: The top two configs use a new llama.cpp build (b10054, CUDA 12.4) with the DFlash + ngram-mod + ngram-map-k4v spec-decoding stack from Reddit research. See the **Spec Decoding Stack** section below.
 
-**Recommendation**: For opencode coding (multi-turn sessions), use `start-server-27b-dflash.ps1`. For pi CLI long-context API work, use `start-server-35b-ngram.ps1`. Fall back to legacy scripts if the new build has issues.
+**Recommendation**: For opencode coding (multi-turn sessions), use `qwen3.6-27b\start-server-27b-dflash.ps1`. For pi CLI long-context API work, use `qwen3.6-35b\start-server-35b-ngram.ps1`. Fall back to legacy scripts if the new build has issues.
 
-**NEW (Aug 2026)**: `start-server-38b.ps1` — Qwen3.8-27B + MTP on llama.cpp b10437, ~53 t/s at 94K context. Replicates HF discussion #26 (same RTX 5060 Ti 16GB hardware). See **Qwen3.8-27B + MTP** section below.
+**NEW (Aug 2026)**: `qwen3.8-27b\start-server-38b.ps1` — Qwen3.8-27B + MTP on llama.cpp b10437, ~53 t/s at 94K context. Replicates HF discussion #26 (same RTX 5060 Ti 16GB hardware). See **Qwen3.8-27B + MTP** section below.
 
 ---
 
-### Qwen3.8-27B + MTP (`start-server-38b.ps1`)
+### Qwen3.8-27B + MTP (`qwen3.8-27b\start-server-38b.ps1`)
 
 **Source**: [HF discussion #26](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/discussions/26) — hfmiguel on RTX 5060 Ti 16GB + 32GB RAM (same hardware as ours).
 
@@ -68,11 +68,11 @@ llama-server.exe -m Qwen3.8-27B-UD-IQ3_XXS.gguf `
 
 **Draft-max tradeoff (from Qwen3.6 lessons #9)**: draft-max=3 can corrupt tool-call JSON when drafts are rejected mid-JSON. Set `$env:LLAMA_DRAFT_MAX="1"` for opencode agent sessions.
 
-**OOM fallback**: 94K is tight. If boot fails, `$env:LLAMA_CONTEXT="65536"; .\start-server-38b.ps1` (KV shrinks to ~2.3GB).
+**OOM fallback**: 94K is tight. If boot fails, `$env:LLAMA_CONTEXT="65536"; .\qwen3.8-27b\start-server-38b.ps1` (KV shrinks to ~2.3GB).
 
 ---
 
-### Production Config: 27B Long Context (`start-server-27b-longctx.ps1`)
+### Production Config: 27B Long Context (`qwen3.6-27b\start-server-27b-longctx.ps1`)
 
 ```powershell
 llama-server.exe -m Qwen3.6-27B-UD-IQ3_XXS.gguf `
@@ -118,7 +118,7 @@ Context size directly controls how much VRAM is reserved for KV cache. More rese
 
 ---
 
-### Production Config: 35B MoE (`start-server-35b.ps1`)
+### Production Config: 35B MoE (`qwen3.6-35b\start-server-35b.ps1`)
 
 ```powershell
 llama-server.exe -m Qwen3.6-35B-A3B-UD-Q4_K_S.gguf `
@@ -236,13 +236,13 @@ These three flags are required for opencode to work correctly with the 27B MTP m
 
 | File | Purpose |
 |------|---------|
-| `start-server-35b.ps1` | 35B MoE production (MTP + ngram, 64k ctx) |
-| `start-server-35b-reddit60.ps1` | 35B baseline (no MTP, for comparison) |
-| `start-server-27b.ps1` | 27B dense opencode (MTP, 32K ctx, chat template, ~30 t/s) |
-| `start-server-27b-longctx.ps1` | 27B dense long-context (no MTP, ~25 t/s at 20K) |
+| `qwen3.6-35b\start-server-35b.ps1` | 35B MoE production (MTP + ngram, 64k ctx) |
+| `qwen3.6-35b\start-server-35b-reddit60.ps1` | 35B baseline (no MTP, for comparison) |
+| `qwen3.6-27b\start-server-27b.ps1` | 27B dense opencode (MTP, 32K ctx, chat template, ~30 t/s) |
+| `qwen3.6-27b\start-server-27b-longctx.ps1` | 27B dense long-context (no MTP, ~25 t/s at 20K) |
 | `stop-server.ps1` | Kill running server |
-| `benchmark-35b.py` | 35B benchmark (5 tasks, proper speed measurement) |
-| `benchmark-27b.py` | 27B benchmark (4 tasks, proper speed measurement) |
+| `qwen3.6-35b\benchmark-35b.py` | 35B benchmark (5 tasks, proper speed measurement) |
+| `qwen3.6-27b\benchmark-27b.py` | 27B benchmark (4 tasks, proper speed measurement) |
 | `benchmark_results/35B_SUMMARY.md` | 35B benchmark results |
 | `benchmark_results/27B_SUMMARY.md` | 27B benchmark results |
 | `benchmark_results/35B_LESSONS_LEARNED.md` | Detailed mistakes and methodology fixes |

@@ -25,7 +25,7 @@ On DDR4 bandwidth-starved hardware (~38 GB/s), a smaller **dense model** (27B IQ
 ### NEWEST: Qwen3.8-27B + MTP — ~50 t/s at 94K context (Aug 2026)
 
 ```powershell
-.\start-server-38b.ps1
+.\qwen3.8-27b\start-server-38b.ps1
 ```
 
 Build: llama.cpp b10437 (CUDA 12.4). Model: Qwen3.8-27B UD-IQ3_XXS (11.9GB, MTP weights embedded). Spec: `draft-mtp` draft-max=3. KV: q4_0. All layers on GPU. `reasoning_effort=medium` (xhigh over-thinks). Chat template embedded in GGUF. Replicates HF discussion #26 — same GPU.
@@ -42,7 +42,7 @@ Build: llama.cpp b10437 (CUDA 12.4). Model: Qwen3.8-27B UD-IQ3_XXS (11.9GB, MTP 
 ### BEST for opencode coding — 27B dense + DFlash + ngram stack (NEW, ~6x on multi-turn)
 
 ```powershell
-.\start-server-27b-dflash.ps1
+.\qwen3.6-27b\start-server-27b-dflash.ps1
 ```
 
 Build: llama.cpp b10054 (CUDA 12.4). Model: Unsloth UD-IQ3_XXS (11.17GB) + Alittlehammmer DFlash-Q8_0 draft (1.8GB). Spec: `draft-dflash,ngram-mod,ngram-map-k4v`, `--fit on`, KV: q4_0, 32K ctx, `-rea off`. Best for opencode coding agent (multi-turn sessions where n-gram cache fills).
@@ -50,7 +50,7 @@ Build: llama.cpp b10054 (CUDA 12.4). Model: Unsloth UD-IQ3_XXS (11.17GB) + Alitt
 ### BEST for long context — 35B MoE + ngram-mod (NEW, PR #25545 CPU-offload gains)
 
 ```powershell
-.\start-server-35b-ngram.ps1
+.\qwen3.6-35b\start-server-35b-ngram.ps1
 ```
 
 Build: llama.cpp b10054 (CUDA 12.4, includes PR #25545 3x CPU-offload speedup). Model: Q4_K_M (19.7GB). Spec: `ngram-mod` (free on VRAM, drafts from host RAM). `--n-cpu-moe 20`, KV: q4_0, 64K ctx. Best for pi CLI long-context API work.
@@ -74,7 +74,7 @@ Model: Unsloth UD-Q4_K_S (19.9GB), KV: q8_0, prompt cache OFF, no MTP.
 ### BEST (proven fallback): ik_llama.cpp + 35B MoE (~43 tok/s at 64K context)
 
 ```powershell
-.\start-server-ik-35b-moe-ncpumoe20.ps1
+.\qwen3.6-35b\start-server-ik-35b-moe-ncpumoe20.ps1
 ```
 
 Model: Q4_K_M (19.7GB), KV: q4_0, `--n-cpu-moe 20`, all dense layers on GPU, MoE experts on CPU.
@@ -83,7 +83,7 @@ Model: Q4_K_M (19.7GB), KV: q4_0, `--n-cpu-moe 20`, all dense layers on GPU, MoE
 
 ```powershell
 $env:LLAMA_CONTEXT = "49152"
-.\start-server-ik-35b-moe-ncpumoe20.ps1
+.\qwen3.6-35b\start-server-ik-35b-moe-ncpumoe20.ps1
 ```
 
 Uses `--n-cpu-moe 16` (fewer experts on CPU = faster gen, but KV overflows at 48K+).
